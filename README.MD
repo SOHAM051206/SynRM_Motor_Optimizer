@@ -43,7 +43,7 @@ Motor_optimizer/                  <-- YOUR MAIN PROJECT FOLDER
 ├── data/                         <-- Copy the .data files here WITH MAPPING
 ├── models/                       <-- AI models are saved here automatically
 ├── results/                      <-- Global metrics and scorecards saved here
-│   ├── design/                   <-- Final optimized geometry data saved here
+│   ├── designs/                   <-- Final optimized geometry data saved here
 │   └── plots/                    <-- Visual scatter plots and charts saved here
 ├── utils/
 │   ├── __pycache__/              <-- Auto-generated Python cache (safely ignore)
