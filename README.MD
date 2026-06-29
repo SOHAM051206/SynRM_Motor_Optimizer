@@ -1,9 +1,9 @@
 ---
-title: Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
-subtitle: Setup and Operating Guide
-author: Soham Wankhade
-version: 1.0
-document_type: Technical README
+Title: Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
+Subtitle: Setup and Operating Guide
+Author: Soham Wankhade
+Version: 1.0
+Document_type: Technical README
 ---
 
 # Rotor Topology and Motor Size Selection with Geometry Optimization of
