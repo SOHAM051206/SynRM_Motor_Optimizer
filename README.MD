@@ -144,9 +144,33 @@ The AI needs your Altair HyperStudy data to learn.
      the rest of the dataset.
    - That is why every run gets a separate "# MAP" entry.
 
-   Example Mapping Header:
-   # MAP | ivr_RFB_C3_A11 | var_1, var_2, var_3, var_4, var_5, var_6, var_7 | r_1, r_2, r_3, r_4
-   # MAP | ivr_RFB_C3_A12 | var_8, var_9, var_10, var_11, var_12, var_13, var_14 | r_5, r_6, r_7, r_8
+### Mapping Configuration
+
+Each HyperStudy `.data` file may contain results from multiple SynRM rotor topologies.  
+The mapping header tells the software **which geometry the data belongs to** and **which columns represent the inputs and outputs**.
+
+**Mapping format**
+
+```text
+# MAP | <Geometry_ID> | <Input Variables> | <Output Responses>
+```
+
+**Example**
+
+```text
+# MAP | ivr_RFB_C3_A11 | var_1,var_2,var_3,var_4,var_5,var_6,var_7 | r_1,r_2,r_3,r_4
+```
+
+| Field | Description |
+|------|-------------|
+| `ivr_RFB_C3_A11` | Geometry (Rotor Topology) ID exported from Altair FluxMotor |
+| `var_1 ... var_7` | Design input variables (barrier dimensions, motor dimensions, control angle, etc.) |
+| `r_1 ... r_4` | Simulation outputs (Torque, Efficiency, Power Factor, Torque Ripple) |
+
+> **Why is mapping required?**
+>
+> A single `.data` file can contain results from multiple rotor geometries.  
+> The mapping ensures every input/output set is linked to the correct SynRM topology, allowing individual geometries to be added or removed without affecting the rest of the dataset.
 
 *** The Power of Flexible Mapping ***
    This mapping system is one of the best features of the code. If any geometry
