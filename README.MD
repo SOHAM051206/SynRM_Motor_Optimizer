@@ -18,12 +18,10 @@ Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
 > **Project:** Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning  
 > **Status:** Draft
 
-========================================================================
-Rotor Topology and Motor Size Selection with Geometry Optimization of
+# Rotor Topology and Motor Size Selection with Geometry Optimization of
 Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
-------------------------------------------------------------------------
-Setup and Operating Guide
-========================================================================
+
+## Setup and Operating Guide
 
 Welcome to the SynRM Rotor Topology and Geometry Optimization Pipeline.
 This tool combines hybrid machine learning (XGBoost and CatBoost) with
