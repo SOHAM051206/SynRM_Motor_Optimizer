@@ -32,6 +32,40 @@ def _parse_custom_mappings(lines: list[str]) -> list[dict]:
                 })
     return mappings
 
+def _filter_invalid_runs(inputs_df: pd.DataFrame, outputs_df: pd.DataFrame, out_cols: list[str]):
+    """
+    Drops rows that almost certainly came from FAILED FEA/CAD builds that
+    HyperStudy logged with a placeholder numeric value (often 0, or a repeat
+    of the previous row) instead of NaN -- a plain dropna() never catches
+    these, so they get baked into training as if they were real, successful
+    designs. That's exactly the kind of contamination that lets a
+    geometrically broken combination (e.g. intersecting flux-barrier lines)
+    look statistically normal to both the model and the data-driven
+    feasibility manifold.
+
+    Assumes the output order seen consistently in your '# MAP |' lines:
+    [Torque, Efficiency, Power factor, Ripple].
+    """
+    if len(out_cols) < 4 or len(outputs_df) == 0:
+        return inputs_df, outputs_df, 0
+
+    torque_col, eff_col, pf_col, ripple_col = out_cols[:4]
+    physically_valid = (
+        (outputs_df[torque_col] > 0) &
+        (outputs_df[eff_col] > 0) & (outputs_df[eff_col] <= 100) &
+        (outputs_df[pf_col] > 0) & (outputs_df[pf_col] <= 1) &
+        (outputs_df[ripple_col] >= 0)
+    )
+
+    combined = pd.concat([inputs_df, outputs_df], axis=1)
+    not_duplicate = ~combined.duplicated(keep='first')
+
+    keep = physically_valid & not_duplicate
+    n_dropped = int((~keep).sum())
+
+    return inputs_df.loc[keep].reset_index(drop=True), outputs_df.loc[keep].reset_index(drop=True), n_dropped
+
+
 def parse_batch_file(filepath: str | Path) -> list[dict]:
     filepath = Path(filepath)
     lines = filepath.read_text(encoding='utf-8', errors='replace').splitlines()
@@ -76,6 +110,10 @@ def parse_batch_file(filepath: str | Path) -> list[dict]:
         common_idx = inputs_df.index.intersection(outputs_df.index)
         inputs_df = inputs_df.loc[common_idx].reset_index(drop=True)
         outputs_df = outputs_df.loc[common_idx].reset_index(drop=True)
+
+        inputs_df, outputs_df, n_dropped = _filter_invalid_runs(inputs_df, outputs_df, out_cols)
+        if n_dropped:
+            print(f"    ⚠ {geom_id}: dropped {n_dropped} row(s) with non-physical or duplicated outputs (likely failed builds)")
 
         in_labels = {c: label_map.get(c, c) for c in inp_cols}
         out_labels = {c: label_map.get(c, c) for c in out_cols}
