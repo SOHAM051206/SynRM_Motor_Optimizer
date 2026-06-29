@@ -1,23 +1,20 @@
----
-Title: Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
-Subtitle: Setup and Operating Guide
-Author: Soham Wankhade
-Version: 1.0
-Document_type: Technical README
----
+# Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
 
-# Rotor Topology and Motor Size Selection with Geometry Optimization of
-Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
-
-## Setup and Operating Guide
-
-> **Document Information**  
+> **Technical README**
+>
 > **Author:** Soham Wankhade  
-> **Version:** 1.0  
-> **Document Type:** Technical README  
-> **Project:** Rotor Topology and Motor Size Selection with Geometry Optimization of Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning  
-> **Status:** Draft
+> **Version:** 1.0.0  
+> **Status:** Stable Release  
+> **Python:** 3.12+  
+> **License:** MIT (or your preferred license)
 
+---
+
+## Overview
+
+This project implements a hybrid Machine Learning and NSGA-II optimization pipeline for rotor topology selection, motor size selection, and geometry optimization of Synchronous Reluctance Motors (SynRM) using Altair HyperStudy simulation data.
+
+---
 ========================================================================
 Rotor Topology and Motor Size Selection with Geometry Optimization of
 Synchronous Reluctance Motors (SynRM) Using Hybrid Machine Learning
@@ -52,26 +49,24 @@ PHASE 1: Prerequisites (Software Installation)
    - Go to code.visualstudio.com and download the installer.
    - Install it using the default settings.
 
-------------------------------------------------------------------------
-PHASE 2: Folder Management & Directory Structure
-------------------------------------------------------------------------
-For the pipeline to work, your files must be organized exactly like this.
-Your main code lives inside the "Motor_optimizer" folder, alongside your
-raw Altair HyperStudy output folders.
+## Phase 2 – Folder Management & Directory Structure
 
-Motor_optimizer/                  <-- YOUR MAIN PROJECT FOLDER
-├── data/                         <-- Copy the .data files here WITH MAPPING
-├── models/                       <-- AI models are saved here automatically
-├── results/                      <-- Global metrics and scorecards saved here
-│   ├── design/                   <-- Final optimized geometry data saved here
-│   └── plots/                    <-- Visual scatter plots and charts saved here
+For the pipeline to work correctly, organize the project as shown below.
+
+```text
+Motor_optimizer/
+├── data/                  # HyperStudy .data files
+├── models/                # Trained ML models
+├── results/
+│   ├── design/            # Optimized designs
+│   └── plots/             # Generated figures
 ├── utils/
-│   ├── __pycache__/              <-- Auto-generated Python cache (safely ignore)
-│   └── data_parser.py            <-- Helper script that reads HyperStudy files
-├── optimize.py                   <-- The NSGA-II optimizer script
-├── train.py                      <-- The AI training script
-├── requirements.txt              <-- Python dependencies list
-└── README.MD                     <-- This instruction guide
+│   └── data_parser.py
+├── optimize.py
+├── train.py
+├── requirements.txt
+└── README.md
+```
 
 ------------------------------------------------------------------------
 PHASE 3: Project Setup
