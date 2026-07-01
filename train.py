@@ -374,7 +374,7 @@ def _plot_pearson_correlation_matrix(gid, X, Y, plot_dir, is_global=False):
     
     fig.tight_layout()
     filename = "_GLOBAL_CORRELATION_MATRIX.png" if is_global else f"{gid}_correlation_matrix.png"
-    fig.savefig(plot_dir / filename, dpi=300, facecolor="#FFFFFF", bbox_inches="tight")
+    fig.savefig(plot_dir / filename, dpi=600, facecolor="#FFFFFF", bbox_inches="tight")
     plt.close(fig)
 
 def _plot_local_comparison(gid, metrics, plot_dir):
@@ -415,7 +415,7 @@ def _plot_local_comparison(gid, metrics, plot_dir):
     autolabel(rects2)
     
     fig.tight_layout()
-    fig.savefig(plot_dir / f"{gid}_xgb_vs_cat_bars.png", dpi=300, facecolor=BG)
+    fig.savefig(plot_dir / f"{gid}_xgb_vs_cat_bars.png", dpi=600, facecolor=BG)
     plt.close(fig)
 
 def _plot_correlation_scatter(gid, Y_te, xgb_preds, cat_preds, plot_dir):
@@ -450,7 +450,7 @@ def _plot_correlation_scatter(gid, Y_te, xgb_preds, cat_preds, plot_dir):
             spine.set_edgecolor(GRID)
             
     fig.tight_layout()
-    fig.savefig(plot_dir / f"{gid}_correlation_scatter.png", dpi=300, bbox_inches="tight", facecolor=BG)
+    fig.savefig(plot_dir / f"{gid}_correlation_scatter.png", dpi=600, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 def _plot_feature_importance(gid, xgb_model, cat_model, var_names, plot_dir):
@@ -519,7 +519,7 @@ def _plot_feature_importance(gid, xgb_model, cat_model, var_names, plot_dir):
     for spine in ax2.spines.values(): spine.set_edgecolor(GRID)
     
     fig.tight_layout()
-    fig.savefig(plot_dir / f"{gid}_feature_importance.png", dpi=300, bbox_inches="tight", facecolor=BG)
+    fig.savefig(plot_dir / f"{gid}_feature_importance.png", dpi=600, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 def _plot_comparative_heatmap(all_metrics: list[dict], plot_dir: Path):
@@ -571,7 +571,7 @@ def _plot_comparative_heatmap(all_metrics: list[dict], plot_dir: Path):
                 text_color = 'white' if (v >= 0.90 or v < 0.75) else 'black'
                 ax.text(j, i, f"{v:.3f}", ha='center', va='center', fontsize=7, color=text_color, fontweight='bold')
 
-    fig.savefig(plot_dir / "_SUMMARY_COMPARATIVE_HEATMAP.png", dpi=300, bbox_inches="tight", facecolor=BG)
+    fig.savefig(plot_dir / "_SUMMARY_COMPARATIVE_HEATMAP.png", dpi=600, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 def _plot_global_comparison(global_tracker, plot_dir):
@@ -605,7 +605,7 @@ def _plot_global_comparison(global_tracker, plot_dir):
             spine.set_edgecolor(GRID)
         
     fig.tight_layout()
-    fig.savefig(plot_dir / "_GLOBAL_SCATTER_COMPARISON.png", dpi=300, bbox_inches="tight", facecolor=BG)
+    fig.savefig(plot_dir / "_GLOBAL_SCATTER_COMPARISON.png", dpi=600, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 def _print_final_verdict(global_tracker, out_dir):
