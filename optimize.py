@@ -653,6 +653,289 @@ def save_decision_dashboard(strict_designs, soft_designs, targets, plot_path, to
     plt.close(fig)
 
 
+def save_decision_dashboard_focused(strict_designs, soft_designs, targets, plot_path, tols=None, top_n=5):
+    """
+    Identical three-panel layout to save_decision_dashboard, EXCEPT Panel A's
+    scatter only shows the top-N ranked geometries (not all evaluated ones).
+    This keeps the plot uncluttered when many geometries were explored -- the
+    user asked for top-N, so only those N points appear, making it easy to
+    read without needing to hunt through a cloud of overlapping markers.
+    The "how to read" and footer sections are also tightened vertically.
+    """
+    pool = strict_designs if strict_designs else soft_designs
+    if not pool:
+        return
+
+    best_per_geom = {}
+    for d in pool:
+        gid = d["geometry_id"]
+        if gid not in best_per_geom or d["score"] < best_per_geom[gid]["score"]:
+            best_per_geom[gid] = d
+    points = list(best_per_geom.values())
+    if not points:
+        return
+
+    torque_all = [d["predicted_outputs"]["torque"] for d in points]
+    eff_all    = [d["predicted_outputs"]["efficiency"] for d in points]
+    ripple_all = [d["predicted_outputs"]["ripple"] for d in points]
+    pf_all     = [d["predicted_outputs"]["power_factor"] for d in points]
+    labels_all = [d["geometry_id"] for d in points]
+    scores_all = [d["score"] for d in points]
+
+    order = sorted(range(len(points)), key=lambda i: scores_all[i])
+    top_n = min(top_n, len(points))
+    top_idx = order[:top_n]
+
+    # ---> KEY CHANGE: scatter only the top-N, not every geometry <---
+    torque = [torque_all[i] for i in top_idx]
+    eff    = [eff_all[i] for i in top_idx]
+    ripple = [ripple_all[i] for i in top_idx]
+    pf     = [pf_all[i] for i in top_idx]
+    labels = [labels_all[i] for i in top_idx]
+    scores = [scores_all[i] for i in top_idx]
+    rank_of_top = {i: r for r, i in enumerate(top_idx, start=1)}
+
+    # Panel B and C still use ALL rankings (just top_n rows in table)
+    ranked_labels_all = [labels_all[idx] for idx in order]
+    ranked_scores_all = [scores_all[idx] for idx in order]
+
+    NAVY = "#1F3A5F"
+    CARD_EDGE = "#9DB8D8"
+    LIGHTBLUE_BG = "#F4F8FC"
+    FOOTER_BG = "#FAFAFA"
+
+    fig = plt.figure(figsize=(20, 9.8))
+    fig.patch.set_facecolor("white")
+
+    outer = gridspec.GridSpec(3, 3, height_ratios=[5.0, 1.3, 0.65], hspace=0.38, wspace=0.34,
+                               left=0.035, right=0.985, top=0.86, bottom=0.05)
+
+    fig.text(0.5, 0.968,
+              "Multi-Objective Optimization of SynRM Geometries \u2014 Three-Panel Decision View (Top-N Focus)",
+              ha="center", fontsize=18, fontweight="bold", color="#1A1A1A")
+    target_bits = []
+    if "torque" in targets: target_bits.append(f"{targets['torque']} N\u00b7m Torque")
+    if "efficiency" in targets: target_bits.append(f"{targets['efficiency']}% Efficiency")
+    if "power_factor" in targets: target_bits.append(f"{targets['power_factor']} Power Factor")
+    if "ripple" in targets: target_bits.append(f"{targets['ripple']}% Ripple")
+    fig.text(0.5, 0.928, "Target: " + ", ".join(target_bits), ha="center", fontsize=12, color="#555555")
+
+    # ---- Panel A: scatter of top-N only ----
+    col0 = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=outer[0, 0], width_ratios=[26, 1], wspace=0.10)
+    axA = fig.add_subplot(col0[0, 0])
+    caxA = fig.add_subplot(col0[0, 1])
+
+    has_band = (tols and "torque" in targets and "efficiency" in targets
+                and "torque" in tols and "efficiency" in tols)
+    if has_band:
+        tx0, tx1 = targets["torque"] - tols["torque"], targets["torque"] + tols["torque"]
+        ty0, ty1 = targets["efficiency"] - tols["efficiency"], targets["efficiency"] + tols["efficiency"]
+        axA.add_patch(plt.Rectangle((tx0, ty0), tx1 - tx0, ty1 - ty0, facecolor="#FFD966", alpha=0.18,
+                                     edgecolor="#BF9000", linewidth=1.3, linestyle="--", zorder=1,
+                                     label=f"Acceptable range\n(\u00b1{tols['torque']} N.m, \u00b1{tols['efficiency']}%)"))
+
+    pf_arr = np.array(pf, dtype=float)
+    pf_span = (pf_arr.max() - pf_arr.min()) or 1e-6
+    sizes = 110 + 520 * (pf_arr - pf_arr.min()) / pf_span
+    sc = axA.scatter(torque, eff, c=ripple, cmap="RdYlGn_r", s=sizes, edgecolor="black",
+                      linewidth=0.9, zorder=3, alpha=0.93)
+
+    if "torque" in targets and "efficiency" in targets:
+        axA.scatter([targets["torque"]], [targets["efficiency"]], marker="*", s=480, color="gold",
+                    edgecolor="black", linewidth=1.1, zorder=5, label="Target")
+    axA.set_xlabel("Torque (N\u00b7m)", fontweight="bold", fontsize=10.5)
+    axA.set_ylabel("Efficiency (%)", fontweight="bold", fontsize=10.5)
+    axA.grid(alpha=0.3, color="#E5E5E5")
+    for sp in axA.spines.values(): sp.set_edgecolor("#DDDDDD")
+    axA.legend(loc="lower left", fontsize=8, framealpha=0.95)
+
+    cbar = fig.colorbar(sc, cax=caxA)
+    cbar.ax.yaxis.set_ticks_position('left')
+    cbar.ax.yaxis.set_label_position('left')
+    cbar.set_label("Ripple (%)", fontsize=9, fontweight="bold")
+    cbar.ax.tick_params(labelsize=8)
+
+    # ---- Panel B: ranking bar (top-N only) ----
+    axB = fig.add_subplot(outer[0, 1])
+    max_score = max(ranked_scores_all) or 1e-6
+    top_labels_b = ranked_labels_all[:top_n]
+    top_scores_b = ranked_scores_all[:top_n]
+    colors_b = plt.cm.RdYlGn_r(np.array(top_scores_b) / max_score)
+    y_pos = np.arange(top_n)[::-1]
+    axB.barh(y_pos, top_scores_b, color=colors_b, edgecolor="black", linewidth=0.5, height=0.68)
+    axB.set_yticks(y_pos)
+    axB.set_yticklabels([f"#{r+1}  {top_labels_b[r]}" for r in range(top_n)], fontsize=8.5)
+    axB.set_xlabel("Match Score (Lower is Better)", fontweight="bold", fontsize=10.5)
+    axB.grid(alpha=0.3, axis="x", color="#E5E5E5")
+    for sp in axB.spines.values(): sp.set_edgecolor("#DDDDDD")
+    for i, v in enumerate(top_scores_b):
+        axB.text(v + max(top_scores_b) * 0.018, y_pos[i], f"{v:.3f}", va="center", fontsize=8.3)
+    axB.set_xlim(0, max(top_scores_b) * 1.18)
+
+    # ---- Panel C: top-N table ----
+    axC = fig.add_subplot(outer[0, 2])
+    axC.axis("off")
+    table_data = [[f"{r+1}", labels_all[order[r]], f"{torque_all[order[r]]:.1f}",
+                   f"{eff_all[order[r]]:.1f}", f"{pf_all[order[r]]:.3f}",
+                   f"{ripple_all[order[r]]:.1f}", f"{scored:.3f}"]
+                  for r, scored in enumerate(ranked_scores_all[:top_n])]
+    col_labels = ["Rank", "Geometry", "Torque\n(N.m)", "Eff.\n(%)", "PF", "Ripple\n(%)", "Match\nScore"]
+    col_widths = [0.10, 0.30, 0.14, 0.12, 0.11, 0.12, 0.15]
+    tbl = axC.table(cellText=table_data, colLabels=col_labels, loc="center",
+                     cellLoc="center", colWidths=col_widths, bbox=[0, 0.06, 1, 0.88])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9.3)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#CCCCCC")
+        if row == 0:
+            cell.set_facecolor(NAVY)
+            cell.set_text_props(color="white", fontweight="bold", fontsize=9.3)
+        else:
+            cell.set_facecolor("#E8F3E3" if row == 1 else ("#F7F7F7" if row % 2 == 0 else "white"))
+            if col == 1: cell.set_text_props(ha="left")
+            if col == 6: cell.set_text_props(fontweight="bold")
+    tbl.scale(1, 1.55)
+
+    # ---- Card frames ----
+    def union_bbox(*axes):
+        b = axes[0].get_position()
+        for a in axes[1:]:
+            b = Bbox.union([b, a.get_position()])
+        return b
+
+    def add_card_frame(fig, bbox, label, title, header_gap=0.046):
+        pad = 0.004
+        rect = plt.Rectangle((bbox.x0 - pad, bbox.y0 - pad), bbox.width + 2 * pad,
+                              bbox.height + 2 * pad + header_gap,
+                              transform=fig.transFigure, facecolor="white", edgecolor=CARD_EDGE,
+                              linewidth=1.3, zorder=-1, clip_on=False)
+        fig.add_artist(rect)
+        bs = 0.020
+        bx = bbox.x0 + 0.010
+        by = bbox.y0 + bbox.height + header_gap - 0.010 - bs
+        fig.add_artist(plt.Rectangle((bx, by), bs, bs, transform=fig.transFigure,
+                                     facecolor=NAVY, edgecolor="none", zorder=1, clip_on=False))
+        fig.text(bx + bs / 2, by + bs / 2, label, ha="center", va="center",
+                  fontsize=11.5, fontweight="bold", color="white", zorder=2)
+        fig.text(bx + bs + 0.010, by + bs / 2, title, ha="left", va="center",
+                  fontsize=12.5, fontweight="bold", color=NAVY, zorder=2)
+
+    add_card_frame(fig, union_bbox(axA, caxA), "A", f"Performance Space: Top {top_n} Geometries")
+    add_card_frame(fig, axB.get_position(), "B", "Ranking: Match Score (Lower is Better)")
+    add_card_frame(fig, axC.get_position(), "C", f"Top {top_n} Designs (Final Selection)")
+
+    # ---- How to read ----
+    def style_htr(ax, bullet_color, text):
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_facecolor(LIGHTBLUE_BG)
+        for sp in ax.spines.values(): sp.set_edgecolor(CARD_EDGE); sp.set_linewidth(1.1)
+        ax.text(0.045, 0.76, "\u25CF", color=bullet_color, fontsize=12, ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.085, 0.76, "How to read:", fontsize=10, fontweight="bold", color=NAVY, ha="left", va="center", transform=ax.transAxes)
+        ax.text(0.045, 0.30, text, fontsize=9, color="#333333", ha="left", va="center", transform=ax.transAxes, linespacing=1.45)
+
+    style_htr(fig.add_subplot(outer[1, 0]), "#2E7D32",
+               f"Only top {top_n} ranked geometries plotted.\nGreener = lower ripple. Larger = higher power factor.")
+    style_htr(fig.add_subplot(outer[1, 1]), "#1565C0",
+               "Lower match score = closer to all targets simultaneously\n(Torque, Efficiency, Power Factor, Ripple).")
+    style_htr(fig.add_subplot(outer[1, 2]), "#B8860B",
+               f"These {top_n} designs give the best overall balance\nacross all four performance objectives.")
+
+    # ---- Footer ----
+    axF = fig.add_subplot(outer[2, :])
+    axF.set_xticks([]); axF.set_yticks([])
+    axF.set_facecolor(FOOTER_BG)
+    for sp in axF.spines.values(): sp.set_edgecolor("#DDDDDD"); sp.set_linewidth(1.0)
+    axF.text(0.012, 0.5, "\u25A0 Targets:", fontsize=10.5, fontweight="bold", color=NAVY,
+              ha="left", va="center", transform=axF.transAxes)
+    axF.text(0.075, 0.5, "   |   ".join(target_bits), fontsize=10, va="center", ha="left",
+              color="#333333", transform=axF.transAxes)
+    if has_band:
+        axF.text(0.99, 0.5,
+                  f"\u25A0 Acceptable Range: \u00b1{tols['torque']} N\u00b7m Torque, \u00b1{tols['efficiency']}% Efficiency",
+                  fontsize=10, va="center", ha="right", color="#333333", fontweight="bold", transform=axF.transAxes)
+
+    fig.savefig(plot_path, dpi=200, facecolor="white")
+    plt.close(fig)
+
+
+def save_performance_scatter_standalone(strict_designs, soft_designs, targets, plot_path, tols=None, top_n=5):
+    """
+    Standalone zoomed-in Panel A: just the Torque vs Efficiency scatter of the
+    top-N designs, with rank numbers on each marker, larger colorbar, and a
+    clean title. Good for dropping into a report or presentation where you only
+    want the spatial performance view without the ranking/table panels.
+    """
+    pool = strict_designs if strict_designs else soft_designs
+    if not pool:
+        return
+
+    best_per_geom = {}
+    for d in pool:
+        gid = d["geometry_id"]
+        if gid not in best_per_geom or d["score"] < best_per_geom[gid]["score"]:
+            best_per_geom[gid] = d
+    points = list(best_per_geom.values())
+    if not points:
+        return
+
+    scores_all = [d["score"] for d in points]
+    order = sorted(range(len(points)), key=lambda i: scores_all[i])
+    top_n = min(top_n, len(points))
+    top_idx = order[:top_n]
+
+    torque = [points[i]["predicted_outputs"]["torque"] for i in top_idx]
+    eff    = [points[i]["predicted_outputs"]["efficiency"] for i in top_idx]
+    ripple = [points[i]["predicted_outputs"]["ripple"] for i in top_idx]
+    pf     = [points[i]["predicted_outputs"]["power_factor"] for i in top_idx]
+
+    NAVY = "#1F3A5F"
+    CARD_EDGE = "#9DB8D8"
+
+    fig, (ax, cax) = plt.subplots(1, 2, figsize=(8.5, 7),
+                                    gridspec_kw={"width_ratios": [22, 1], "wspace": 0.08})
+    fig.patch.set_facecolor("white")
+
+    has_band = (tols and "torque" in targets and "efficiency" in targets
+                and "torque" in tols and "efficiency" in tols)
+    if has_band:
+        tx0, tx1 = targets["torque"] - tols["torque"], targets["torque"] + tols["torque"]
+        ty0, ty1 = targets["efficiency"] - tols["efficiency"], targets["efficiency"] + tols["efficiency"]
+        ax.add_patch(plt.Rectangle((tx0, ty0), tx1 - tx0, ty1 - ty0, facecolor="#FFD966", alpha=0.18,
+                                    edgecolor="#BF9000", linewidth=1.4, linestyle="--", zorder=1,
+                                    label=f"Acceptable range\n(\u00b1{tols['torque']} N.m, \u00b1{tols['efficiency']}%)"))
+
+    pf_arr = np.array(pf, dtype=float)
+    pf_span = (pf_arr.max() - pf_arr.min()) or 1e-6
+    sizes = 130 + 600 * (pf_arr - pf_arr.min()) / pf_span
+    sc = ax.scatter(torque, eff, c=ripple, cmap="RdYlGn_r", s=sizes, edgecolor="black",
+                     linewidth=1.0, zorder=3, alpha=0.93)
+
+    import matplotlib.patheffects as pe_local
+    if "torque" in targets and "efficiency" in targets:
+        ax.scatter([targets["torque"]], [targets["efficiency"]], marker="*", s=550, color="gold",
+                   edgecolor="black", linewidth=1.2, zorder=5, label="Target")
+
+    ax.set_xlabel("Torque (N\u00b7m)", fontweight="bold", fontsize=12)
+    ax.set_ylabel("Efficiency (%)", fontweight="bold", fontsize=12)
+    ax.set_title(f"Performance Space: Top {top_n} Geometries (Torque vs Efficiency)",
+                  fontsize=13, fontweight="bold", color=NAVY, pad=14)
+    ax.grid(alpha=0.3, color="#E5E5E5")
+    for sp in ax.spines.values(): sp.set_edgecolor("#DDDDDD"); sp.set_linewidth(0.8)
+    ax.legend(loc="lower left", fontsize=9, framealpha=0.95)
+    ax.text(0.0, 1.01, "Color = Ripple (%)   |   Size = Power Factor",
+             transform=ax.transAxes, fontsize=10, color="#555555")
+
+    cbar = fig.colorbar(sc, cax=cax)
+    cbar.ax.yaxis.set_ticks_position('left')
+    cbar.ax.yaxis.set_label_position('left')
+    cbar.set_label("Ripple (%)", fontsize=10, fontweight="bold")
+    cbar.ax.tick_params(labelsize=9)
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=250, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
 def save_radar_chart(top_unique, targets, plot_path):
     """
     Spider/radar chart comparing the top designs across all active metrics
@@ -1147,6 +1430,24 @@ def main():
     except Exception as e:
         print(f"  [!] Could not generate three-panel decision dashboard: {e}")
 
+    decision_focused_path = out_dir / f"Optimization_DecisionDashboard_TopN_{timestamp}.png"
+    decision_focused_saved = False
+    try:
+        if strict_designs or soft_designs:
+            save_decision_dashboard_focused(strict_designs, soft_designs, targets, decision_focused_path, tols, top_n=args.top_n)
+            decision_focused_saved = decision_focused_path.exists()
+    except Exception as e:
+        print(f"  [!] Could not generate focused decision dashboard: {e}")
+
+    scatter_standalone_path = out_dir / f"Optimization_PerformanceScatter_TopN_{timestamp}.png"
+    scatter_standalone_saved = False
+    try:
+        if strict_designs or soft_designs:
+            save_performance_scatter_standalone(strict_designs, soft_designs, targets, scatter_standalone_path, tols, top_n=args.top_n)
+            scatter_standalone_saved = scatter_standalone_path.exists()
+    except Exception as e:
+        print(f"  [!] Could not generate standalone performance scatter: {e}")
+
     schematic_path = out_dir / f"Optimization_CrossSection_{timestamp}.png"
     schematic_saved = False
     try:
@@ -1156,13 +1457,15 @@ def main():
     except Exception as e:
         print(f"  [!] Could not generate geometry cross-section schematic: {e}")
 
-    if excel_saved or dashboard_saved or pareto_saved or radar_saved or decision_saved or schematic_saved:
+    if excel_saved or dashboard_saved or pareto_saved or radar_saved or decision_saved or decision_focused_saved or scatter_standalone_saved or schematic_saved:
         print("\n" + "=" * 80)
         if excel_saved: print(f"  📁 SAVED EXCEL REPORT: {excel_path}")
         if dashboard_saved: print(f"  📊 SAVED VISUAL DASHBOARD: {plot_path}")
         if pareto_saved: print(f"  📈 SAVED PARETO TRADE-OFF PLOT: {pareto_path}")
         if radar_saved: print(f"  🕸️  SAVED RADAR COMPARISON CHART: {radar_path}")
-        if decision_saved: print(f"  🗳️  SAVED DECISION DASHBOARD: {decision_path}")
+        if decision_saved: print(f"  🗳️  SAVED DECISION DASHBOARD (ALL): {decision_path}")
+        if decision_focused_saved: print(f"  🎯  SAVED DECISION DASHBOARD (TOP-N FOCUS): {decision_focused_path}")
+        if scatter_standalone_saved: print(f"  🔍  SAVED PERFORMANCE SCATTER (TOP-N): {scatter_standalone_path}")
         if schematic_saved: print(f"  ⚙️  SAVED CROSS-SECTION SCHEMATIC: {schematic_path}")
         print("=" * 80 + "\n")
 
