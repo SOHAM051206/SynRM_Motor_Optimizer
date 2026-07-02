@@ -293,6 +293,17 @@ def train_and_compare(geom: dict, model_dir: Path, plot_dir: Path, global_tracke
     # Generate the grouped feature importance visual
     _plot_feature_importance(gid, xgb_model, cat_model, list(X.columns), plot_dir)
 
+    # Generate the per-geometry relative-error histograms (Mean / 95th pct), per output param
+    local_error_data = {
+        f"y{oi+1}": {
+            "actual":   Y_te.iloc[:, oi].values,
+            "xgb_pred": xgb_preds[:, oi],
+            "cat_pred": cat_preds[:, oi],
+        }
+        for oi in range(n_out)
+    }
+    _plot_error_histogram(gid, local_error_data, plot_dir, is_global=False)
+
     # Generate Pearson correlation matrix for the local geometry
     _plot_pearson_correlation_matrix(gid, X, Y, plot_dir)
     
@@ -451,6 +462,66 @@ def _plot_correlation_scatter(gid, Y_te, xgb_preds, cat_preds, plot_dir):
             
     fig.tight_layout()
     fig.savefig(plot_dir / f"{gid}_correlation_scatter.png", dpi=600, bbox_inches="tight", facecolor=BG)
+    plt.close(fig)
+
+def _relative_error_pct(y_act: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """Per-sample relative error (%), matching the MAPE-style definition used elsewhere."""
+    y_act  = np.asarray(y_act, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom  = np.where(np.abs(y_act) < 1e-9, 1e-9, np.abs(y_act))
+    return np.abs(y_pred - y_act) / denom * 100.0
+
+def _plot_error_histogram(gid, data_dict, plot_dir, is_global=False):
+    """
+    Relative-error diagnostic histograms (Mean / 95th-percentile markers), in the
+    style of the SVR/XGBoost 'Torque Error' / 'Ripple Error' reference plots --
+    one row per model (XGBoost, CatBoost), one column per output parameter.
+
+    data_dict must map each output key ("y1".."y4") to a dict with "actual",
+    "xgb_pred", and "cat_pred" arrays -- i.e. the same shape as global_tracker,
+    or an equivalent per-geometry dict built from a single train/test split.
+    """
+    out_keys   = ["y1", "y2", "y3", "y4"]
+    out_labels = [OUTPUT_NAMES.get(k, k) for k in out_keys]
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+    fig.patch.set_facecolor(BG)
+    title_prefix = "[GLOBAL]" if is_global else f"[{gid}]"
+    fig.suptitle(f"{title_prefix} Relative Error Distribution: XGBoost vs CatBoost",
+                 fontsize=15, fontweight="bold", y=1.03)
+
+    model_rows = [
+        ("XGBoost",  "xgb_pred", XGB_C, "#d62728", "#ff7f0e"),   # bar, mean-line, 95th-line colors
+        ("CatBoost", "cat_pred", CAT_C, "#d62728", "#8c564b"),
+    ]
+
+    for row_idx, (model_name, pred_key, bar_c, mean_c, pct_c) in enumerate(model_rows):
+        for col_idx, okey in enumerate(out_keys):
+            ax = axes[row_idx, col_idx]
+            ax.set_facecolor(BG)
+
+            y_act  = np.array(data_dict[okey]["actual"])
+            y_pred = np.array(data_dict[okey][pred_key])
+            rel_err = _relative_error_pct(y_act, y_pred)
+
+            mean_err = float(rel_err.mean())
+            pct95    = float(np.percentile(rel_err, 95))
+
+            ax.hist(rel_err, bins=12, color=bar_c, edgecolor="white", alpha=0.85)
+            ax.axvline(mean_err, color=mean_c, linestyle="--", lw=1.5, label=f"Mean={mean_err:.2f}%")
+            ax.axvline(pct95, color=pct_c, linestyle="--", lw=1.5, label=f"95th={pct95:.2f}%")
+
+            ax.set_title(f"{model_name} {out_labels[col_idx]} Error", color=TEXT, fontsize=10, fontweight="bold")
+            ax.set_xlabel("Relative Error (%)")
+            ax.set_ylabel("Count")
+            ax.legend(fontsize=7, facecolor=BG, edgecolor=GRID)
+            ax.grid(True, alpha=0.3)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(GRID)
+
+    fig.tight_layout()
+    filename = "_GLOBAL_ERROR_HISTOGRAM.png" if is_global else f"{gid}_error_histogram.png"
+    fig.savefig(plot_dir / filename, dpi=600, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
 
 def _plot_feature_importance(gid, xgb_model, cat_model, var_names, plot_dir):
@@ -715,6 +786,7 @@ def main():
         
     _plot_comparative_heatmap(all_metrics, plot_dir)
     _plot_global_comparison(global_tracker, plot_dir)
+    _plot_error_histogram("GLOBAL", global_tracker, plot_dir, is_global=True)
     _print_final_verdict(global_tracker, out_dir)
     
     print(f"✓ All visuals and tracking json saved to: {out_dir}")
