@@ -3,6 +3,11 @@ train.py
 The Ultimate Engineering Showdown: XGBoost vs CatBoost
 Includes Global Scatter Plots, Side-by-Side Heatmaps, Local 1x4 Diagnostic Scatters,
 Grouped Feature Importance Bar Charts, Pearson Correlation Matrices, AND automatically generates the required _bounds.json files.
+
+Error reporting: MAPE has been removed entirely (it blows up near zero-valued
+actuals, which happens often with Torque/Efficiency near light-load points).
+Instead every place that used to report MAPE now reports MAE (native units),
+WAPE (%), and sMAPE (%) -- see `_error_summary()` below.
 """
 
 import argparse
@@ -18,7 +23,7 @@ import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_percentage_error
+from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
@@ -61,6 +66,49 @@ OUTPUT_NAMES = {
     "y3": "Power Factor",
     "y4": "Torque Ripple (%)",
 }
+
+# ── error metric helpers ─────────────────────────────────────────────────────
+
+def _wape(y_act: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Weighted Absolute Percentage Error (%).
+    sum(|actual - pred|) / sum(|actual|) * 100
+
+    Unlike MAPE, a single near-zero actual value cannot blow this metric up --
+    it's one aggregate ratio instead of an average of per-row ratios.
+    """
+    y_act  = np.asarray(y_act, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom  = np.sum(np.abs(y_act))
+    if denom < 1e-12:
+        return 0.0
+    return float(np.sum(np.abs(y_act - y_pred)) / denom * 100.0)
+
+
+def _smape(y_act: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Symmetric Mean Absolute Percentage Error (%).
+    mean( |actual - pred| / ((|actual| + |pred|) / 2) ) * 100
+
+    Bounded 0-200%, and far more stable near zero than plain MAPE since the
+    denominator uses both actual AND predicted magnitude.
+    """
+    y_act  = np.asarray(y_act, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom  = (np.abs(y_act) + np.abs(y_pred)) / 2.0
+    denom  = np.where(denom < 1e-12, 1e-12, denom)
+    return float(np.mean(np.abs(y_act - y_pred) / denom) * 100.0)
+
+
+def _error_summary(y_act: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Returns MAE (native units), WAPE (%), and sMAPE (%) for one prediction set."""
+    y_act  = np.asarray(y_act, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "mae":   float(mean_absolute_error(y_act, y_pred)),
+        "wape":  _wape(y_act, y_pred),
+        "smape": _smape(y_act, y_pred),
+    }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -253,9 +301,13 @@ def train_and_compare(geom: dict, model_dir: Path, plot_dir: Path, global_tracke
     # --- 3. METRICS EVALUATION ---
     results = {"geometry_id": gid, "outputs": {}}
     
-    print(f"\n  --- METRICS FOR {gid} ({idx}/{total}) ---")
-    print(f"  {'Output':<15} | {'XGBoost R²':<12} | {'CatBoost R²':<12} | {'Winner':<10}")
-    print("  " + "-" * 55)
+    LABEL_W = 20  # widest label is "Torque Ripple (%)" (18 chars) -- keep everything aligned to this
+
+    print(f"\n  {'-' * 72}")
+    print(f"  METRICS FOR {gid}  ({idx}/{total})")
+    print(f"  {'-' * 72}")
+    print(f"  {'Output':<{LABEL_W}} | {'XGBoost R²':>10} | {'CatBoost R²':>11} | {'Winner':<10}")
+    print("  " + "-" * 72)
 
     for oi in range(n_out):
         oname = f"y{oi+1}"
@@ -267,21 +319,27 @@ def train_and_compare(geom: dict, model_dir: Path, plot_dir: Path, global_tracke
         
         xgb_r2   = r2_score(y_act, xgb_y)
         cat_r2   = r2_score(y_act, cat_y)
-        xgb_mape = mean_absolute_percentage_error(y_act, xgb_y) * 100
-        cat_mape = mean_absolute_percentage_error(y_act, cat_y) * 100
+
+        xgb_err = _error_summary(y_act, xgb_y)
+        cat_err = _error_summary(y_act, cat_y)
         
         winner = "CatBoost" if cat_r2 > xgb_r2 else ("XGBoost" if xgb_r2 > cat_r2 else "Tie")
-        print(f"  {label:<15} | {xgb_r2:12.4f} | {cat_r2:12.4f} | {winner}")
+        print(f"  {label:<{LABEL_W}} | {xgb_r2:>10.4f} | {cat_r2:>11.4f} | {winner}")
+        print(f"  {'':<{LABEL_W}} |   XGB -> MAE: {xgb_err['mae']:<10.4f} WAPE: {xgb_err['wape']:>6.2f}%   sMAPE: {xgb_err['smape']:>6.2f}%")
+        print(f"  {'':<{LABEL_W}} |   CAT -> MAE: {cat_err['mae']:<10.4f} WAPE: {cat_err['wape']:>6.2f}%   sMAPE: {cat_err['smape']:>6.2f}%")
         
         results["outputs"][oname] = {
             "xgb_r2": xgb_r2, "cat_r2": cat_r2,
-            "xgb_mape": xgb_mape, "cat_mape": cat_mape
+            "xgb_mae": xgb_err["mae"], "cat_mae": cat_err["mae"],
+            "xgb_wape": xgb_err["wape"], "cat_wape": cat_err["wape"],
+            "xgb_smape": xgb_err["smape"], "cat_smape": cat_err["smape"],
         }
 
         global_tracker[oname]["actual"].extend(y_act)
         global_tracker[oname]["xgb_pred"].extend(xgb_y)
         global_tracker[oname]["cat_pred"].extend(cat_y)
 
+    print("  " + "-" * 72)
     print(f"  [Speed] XGBoost: {xgb_train_time:.2f}s  |  CatBoost: {cat_train_time:.2f}s")
     global_tracker["time"]["xgb"].append(xgb_train_time)
     global_tracker["time"]["cat"].append(cat_train_time)
@@ -465,10 +523,16 @@ def _plot_correlation_scatter(gid, Y_te, xgb_preds, cat_preds, plot_dir):
     plt.close(fig)
 
 def _relative_error_pct(y_act: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """Per-sample relative error (%), matching the MAPE-style definition used elsewhere."""
+    """
+    Per-sample symmetric relative error (%), used for the diagnostic histograms.
+    Uses the sMAPE-style denominator (avg of |actual| and |pred|) instead of a
+    pure MAPE-style denominator, so a handful of near-zero actual rows no
+    longer dominate/skew the histogram.
+    """
     y_act  = np.asarray(y_act, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    denom  = np.where(np.abs(y_act) < 1e-9, 1e-9, np.abs(y_act))
+    denom  = (np.abs(y_act) + np.abs(y_pred)) / 2.0
+    denom  = np.where(denom < 1e-9, 1e-9, denom)
     return np.abs(y_pred - y_act) / denom * 100.0
 
 def _plot_error_histogram(gid, data_dict, plot_dir, is_global=False):
@@ -680,9 +744,9 @@ def _plot_global_comparison(global_tracker, plot_dir):
     plt.close(fig)
 
 def _print_final_verdict(global_tracker, out_dir):
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     print("  🏆 GLOBAL SHOWDOWN VERDICT")
-    print("=" * 60)
+    print("=" * 72)
     
     out_keys = ["y1", "y2", "y3", "y4"]
     xgb_wins = 0
@@ -695,12 +759,13 @@ def _print_final_verdict(global_tracker, out_dir):
         
         xgb_r2 = r2_score(y_act, xgb_y)
         cat_r2 = r2_score(y_act, cat_y)
-        xgb_mape = mean_absolute_percentage_error(y_act, xgb_y) * 100
-        cat_mape = mean_absolute_percentage_error(y_act, cat_y) * 100
+
+        xgb_err = _error_summary(y_act, xgb_y)
+        cat_err = _error_summary(y_act, cat_y)
 
         print(f"\n  {OUTPUT_NAMES[okey].upper()}:")
-        print(f"    XGBoost  -> R²: {xgb_r2:.4f} | Error (MAPE): {xgb_mape:.2f}%")
-        print(f"    CatBoost -> R²: {cat_r2:.4f} | Error (MAPE): {cat_mape:.2f}%")
+        print(f"    XGBoost  -> R²: {xgb_r2:.4f} | MAE: {xgb_err['mae']:.4f} | WAPE: {xgb_err['wape']:.2f}% | sMAPE: {xgb_err['smape']:.2f}%")
+        print(f"    CatBoost -> R²: {cat_r2:.4f} | MAE: {cat_err['mae']:.4f} | WAPE: {cat_err['wape']:.2f}% | sMAPE: {cat_err['smape']:.2f}%")
         
         if cat_r2 > xgb_r2:
             cat_wins += 1
@@ -716,14 +781,14 @@ def _print_final_verdict(global_tracker, out_dir):
     print(f"    XGBoost : {tot_xgb_time:.2f} seconds")
     print(f"    CatBoost: {tot_cat_time:.2f} seconds")
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     if cat_wins > xgb_wins:
         print("  FINAL CONCLUSION: CATBOOST IS THE SUPERIOR ENGINE.")
     elif xgb_wins > cat_wins:
         print("  FINAL CONCLUSION: XGBOOST IS THE SUPERIOR ENGINE.")
     else:
         print("  FINAL CONCLUSION: IT IS A DEAD TIE. LOOK AT SPEED TO DECIDE.")
-    print("=" * 60 + "\n")
+    print("=" * 72 + "\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Global Showdown: XGBoost vs CatBoost")
@@ -745,8 +810,17 @@ def main():
     print("  INITIALIZING GLOBAL SHOWDOWN: XGBoost vs CatBoost")
     print("=" * 60)
 
+    n_data_files = len(sorted(data_dir.glob("*.data")))
+    print(f"  Data folder : {data_dir}")
+    print(f"  Files found : {n_data_files} .data file(s)")
+    print("=" * 60)
+
     geometries = load_all_data_files(data_dir)
     total_geoms = len(geometries)
+
+    print("=" * 60)
+    print(f"  ✓ PARSING COMPLETE: {n_data_files} file(s) -> {total_geoms} geometrie(s) total")
+    print("=" * 60)
     
     global_tracker = {
         "y1": {"actual": [], "xgb_pred": [], "cat_pred": []},
