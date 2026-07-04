@@ -8,6 +8,45 @@ import re
 import pandas as pd
 from pathlib import Path
 
+
+def find_stator_rotor_names(names):
+    """
+    Given any iterable of column / variable names, finds the two names
+    relevant to the mechanical airgap: Stator Inner diameter and Rotor Outer
+    diameter.
+
+    Supports common label variants produced by HyperStudy / relabeling:
+      - Stator::Inner / Rotor::Outer
+      - Stator Inner / Rotor Outer
+      - Stator Inner Diameter / Rotor Outer Diameter
+      - mixed-case variants
+
+    This is the single source of truth for the airgap lookup shared by
+    train.py and optimize.py.
+    """
+    names = list(names)
+
+    def _matches_stator(s: str) -> bool:
+        s_low = str(s).lower()
+        return (
+            "stator::inner" in s_low
+            or "stator inner" in s_low
+            or ("stator" in s_low and "inner" in s_low and "rotor" not in s_low)
+        )
+
+    def _matches_rotor(s: str) -> bool:
+        s_low = str(s).lower()
+        return (
+            "rotor::outer" in s_low
+            or "rotor outer" in s_low
+            or ("rotor" in s_low and "outer" in s_low)
+        )
+
+    stator = next((c for c in names if _matches_stator(c)), None)
+    rotor = next((c for c in names if _matches_rotor(c)), None)
+    return stator, rotor
+
+
 def _parse_meta_labels(lines: list[str]) -> dict[str, str]:
     varnames, labels = [], []
     for line in lines:
@@ -27,8 +66,8 @@ def _parse_custom_mappings(lines: list[str]) -> list[dict]:
             if len(parts) >= 4:
                 mappings.append({
                     "geom_id": parts[1],
-                    "inputs": [v.strip() for v in parts[2].split(',')],
-                    "outputs": [r.strip() for r in parts[3].split(',')]
+                    "inputs": [v.strip() for v in parts[2].split(',') if v.strip()],
+                    "outputs": [r.strip() for r in parts[3].split(',') if r.strip()]
                 })
     return mappings
 
@@ -79,8 +118,9 @@ def parse_batch_file(filepath: str | Path) -> list[dict]:
 
     header_idx = None
     for i, line in enumerate(lines):
-        if line.startswith('v202'):
-            header_idx = i + 1 
+        stripped = line.strip()
+        if stripped.lower().startswith('v202') or stripped.lower().startswith('variables') or stripped.lower().startswith('var'):
+            header_idx = i + 1
             break
 
     if header_idx is None:
