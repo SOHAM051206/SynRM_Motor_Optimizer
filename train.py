@@ -34,7 +34,7 @@ from catboost import CatBoostRegressor
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.data_parser import load_all_data_files
+from utils.data_parser import load_all_data_files, find_stator_rotor_names
 
 warnings.filterwarnings("ignore")
 
@@ -124,9 +124,14 @@ def _detect_airgap_info(X: pd.DataFrame, fixed_tol: float = 0.05) -> dict | None
     - If the data spans a real range of gaps, mark it 'variable' and record
       the observed min/max so the optimizer can search within that range
       instead of extrapolating beyond what the AI was actually trained on.
+
+    Column lookup is delegated to find_stator_rotor_names() (shared with
+    optimize.py) so both files always agree on which column counts as the
+    Stator Inner / Rotor Outer diameter, regardless of whether the dataset's
+    labels use the raw "Stator::Inner" form or the space-separated
+    "Stator Inner" form produced by hstLabels relabeling.
     """
-    stator_col = next((c for c in X.columns if "Stator::Inner" in str(c) or "Stator Inner" in str(c)), None)
-    rotor_col  = next((c for c in X.columns if "Rotor::Outer" in str(c) or "Rotor Outer" in str(c)), None)
+    stator_col, rotor_col = find_stator_rotor_names(X.columns)
     if stator_col is None or rotor_col is None:
         return None
 
@@ -170,6 +175,14 @@ def _fit_manifold(X: pd.DataFrame, k: int = 5, margin: float = 1.25) -> dict:
     """
     vals = X.values.astype(float)
     n = len(vals)
+    if n < 2:
+        return {
+            'points': vals.tolist(),
+            'mean': [0.0] * vals.shape[1],
+            'std': [1.0] * vals.shape[1],
+            'k': 1,
+            'threshold': float('inf'),
+        }
     k_eff = max(1, min(k, n - 1))
 
     scaler = StandardScaler().fit(vals)
@@ -196,8 +209,8 @@ def _fit_manifold(X: pd.DataFrame, k: int = 5, margin: float = 1.25) -> dict:
 def _fit_radial_depth_budget(X: pd.DataFrame, margin: float = 1.05) -> dict | None:
     """
     Learns the relationship between available rotor radial depth and total
-    flux-barrier size -- the specific mechanism behind 'Rotor Inner diameter
-    too large -> barriers don't fit -> sketch lines intersect'.
+    flux-barrier size -- the specific mechanism behind 'Rotor Inner
+    diameter too large -> barriers don't fit -> sketch lines intersect'.
 
     Available radial depth = (Rotor Outer - Rotor Inner) / 2. Barriers
     (TM1A, TM2A, T1A, T2, and the B/C/D/E equivalents) all stack inside that
@@ -208,8 +221,10 @@ def _fit_radial_depth_budget(X: pd.DataFrame, margin: float = 1.05) -> dict | No
     size, and requires future candidates to respect at least the tightest
     margin ever actually observed (with a small safety buffer).
     """
-    rotor_outer_col = next((c for c in X.columns if "Rotor" in c and "Outer" in c), None)
-    rotor_inner_col = next((c for c in X.columns if "Rotor" in c and "Inner" in c), None)
+    rotor_outer_col, rotor_inner_col = find_stator_rotor_names(X.columns)
+    if rotor_outer_col is None or rotor_inner_col is None:
+        rotor_outer_col = next((c for c in X.columns if "Rotor" in str(c) and "Outer" in str(c)), None)
+        rotor_inner_col = next((c for c in X.columns if "Rotor" in str(c) and "Inner" in str(c)), None)
     barrier_cols = [c for c in X.columns if "(mm)" in c and "Stator" not in c and "Rotor" not in c]
 
     if rotor_outer_col is None or rotor_inner_col is None or not barrier_cols:
@@ -258,6 +273,8 @@ def save_bounds(geom: dict, model_dir: Path):
             print(f"    ↳ {gid}: airgap detected as FIXED ≈ {ag['observed_mean_radial']:.3f}mm radial (from data)")
         else:
             print(f"    ↳ {gid}: airgap detected as VARIABLE, {ag['observed_min_radial']:.3f}-{ag['observed_max_radial']:.3f}mm radial (from data)")
+    else:
+        print(f"    ↳ {gid}: WARNING -- no Stator Inner / Rotor Outer columns found, airgap enforcement will be skipped for this geometry")
     print(f"    ↳ {gid}: feasibility manifold fitted over {len(bounds['var_names'])} variables "
           f"(k={bounds['manifold']['k']}, threshold={bounds['manifold']['threshold']:.3f})")
     rdb = bounds['radial_depth_budget']
