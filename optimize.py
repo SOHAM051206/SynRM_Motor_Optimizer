@@ -29,6 +29,10 @@ from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from sklearn.neighbors import NearestNeighbors
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.data_parser import find_stator_rotor_names
+
 warnings.filterwarnings("ignore")
 
 TARGET_MAP = {"torque": 0, "efficiency": 1, "power_factor": 2, "ripple": 3}
@@ -40,11 +44,45 @@ def clean_var_name(name):
     """Cleans Altair variable names while preserving Stator/Rotor distinctions."""
     name_str = str(name)
     parts = name_str.split("::")
-    
+
     if len(parts) >= 2 and parts[-2] in ["Stator", "Rotor"]:
         return f"{parts[-2]} {parts[-1]}".strip()
-    
+
     return parts[-1].strip()
+
+
+def _find_airgap_indices(var_names):
+    """
+    Resolves the Stator Inner / Rotor Outer column names into integer
+    positions within var_names, using the SAME lookup (find_stator_rotor_names,
+    shared with train.py) that generated airgap_info in the first place.
+
+    Previously this file re-implemented the lookup twice, independently, and
+    both copies only matched the "Stator::Inner" / "Rotor::Outer" (double
+    colon) form -- NOT the "Stator Inner" / "Rotor Outer" (space) form that
+    train.py's own detector explicitly supports. If a dataset's relabeled
+    columns used the space form, train.py would still write a valid,
+    non-null airgap_info block into {gid}_bounds.json, but both places in
+    this file that needed to actually USE it (HybridMotorProblemVec.__init__
+    and optimize_geometry) would fail to find the columns, leaving
+    stator_in_idx / rotor_out_idx at -1. enforce_airgap() silently no-ops
+    whenever either index is -1, so airgap enforcement would be dead for
+    that geometry with no error or warning printed anywhere -- the exported
+    "strictly enforced" designs would never have had their rotor outer
+    diameter snapped to the trained relationship at all.
+
+    Centralizing the lookup here (delegating to the same helper train.py
+    uses) means both files can never disagree about which column is which.
+
+    Returns:
+        (stator_idx, rotor_idx) -- either is -1 if the corresponding column
+        wasn't found among var_names.
+    """
+    var_names = list(var_names)
+    stator_name, rotor_name = find_stator_rotor_names(var_names)
+    stator_idx = var_names.index(stator_name) if stator_name is not None else -1
+    rotor_idx = var_names.index(rotor_name) if rotor_name is not None else -1
+    return stator_idx, rotor_idx
 
 
 def manifold_distance(x, mean, std, nn_index, k):
@@ -79,6 +117,14 @@ def enforce_airgap(x, stator_idx, rotor_idx, airgap_info):
                                                variable airgaps without extrapolating
                                                past what the AI was trained on.
 
+    NOTE: all values in airgap_info (observed_mean_diametric,
+    observed_min_diametric, observed_max_diametric) are DIAMETRIC
+    (Stator Inner - Rotor Outer), i.e. exactly twice the physical/mechanical
+    RADIAL airgap. Any radial-facing values (e.g. user CLI input) must be
+    converted to diametric (multiplied by 2) BEFORE they reach this function
+    or airgap_info -- this function itself only ever operates in diametric
+    space, consistent with how it was measured from the training data.
+
     Critically: this is called ONCE, identically, both during NSGA-II's internal
     evaluation and during final design export, so the performance numbers you see
     always correspond to the geometry you actually get (previously the code zeroed
@@ -106,12 +152,10 @@ def enforce_airgap(x, stator_idx, rotor_idx, airgap_info):
 class HybridMotorProblemVec(Problem):
     def __init__(self, cat_model, xgb_model, winners, bounds, targets, config, var_names, airgap_info=None, manifold=None, radial_depth_budget=None):
         self.active_keys = list(targets.keys())
-        
-        self.stator_in_idx = -1
-        self.rotor_out_idx = -1
-        for i, n in enumerate(var_names):
-            if "Stator::Inner" in str(n): self.stator_in_idx = i
-            elif "Rotor::Outer" in str(n): self.rotor_out_idx = i
+
+        # ---> FIXED: delegate to the shared, tolerant lookup (matches
+        # train.py's column detection) instead of a local "::"-only check. <---
+        self.stator_in_idx, self.rotor_out_idx = _find_airgap_indices(var_names)
 
         self.airgap_info = airgap_info
 
@@ -157,7 +201,7 @@ class HybridMotorProblemVec(Problem):
     def _evaluate(self, x, out, *args, **kwargs):
         F_list = []
         G_list = []
-        
+
         # ---> DATA-DRIVEN AIRGAP ENFORCEMENT <---
         # Instead of zeroing rotor_out (which fed the model an input it never
         # saw in training and caused unreliable, out-of-distribution predictions),
@@ -168,19 +212,19 @@ class HybridMotorProblemVec(Problem):
 
         cat_preds = self.cat_model.predict(x)
         xgb_preds = self.xgb_model.predict(x)
-        
+
         if cat_preds.ndim == 1: cat_preds = cat_preds.reshape(1, -1)
         if xgb_preds.ndim == 1: xgb_preds = xgb_preds.reshape(1, -1)
-        
+
         for k in self.active_keys:
             col_idx = TARGET_MAP[k]
             y_key = Y_KEYS[col_idx]
-            
+
             y = cat_preds[:, col_idx] if self.winners[y_key] == "CatBoost" else xgb_preds[:, col_idx]
-            
+
             f = np.abs(y - self.targets[k])
             F_list.append(f)
-            
+
             g_lower = (self.targets[k] - self.config[k]) - y
             g_upper = y - (self.targets[k] + self.config[k])
             G_list.append(g_lower)
@@ -232,55 +276,55 @@ def flatten_designs(designs_list):
             "Power Factor": d["predicted_outputs"]["power_factor"],
             "Ripple (%)": d["predicted_outputs"]["ripple"],
         }
-        
+
         for name, val in zip(d["var_names"], d["input_values"]):
             clean_name = clean_var_name(name)
             row[clean_name] = val
-            
+
         row["Torque_Engine"] = d["winners"]["y1"]
         row["Eff_Engine"] = d["winners"]["y2"]
         row["PF_Engine"] = d["winners"]["y3"]
         row["Ripple_Engine"] = d["winners"]["y4"]
-        
+
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def save_pictorial_result(designs, targets, plot_path):
     if not designs: return
-    
+
     labels = [f"#{i+1}\n{d['geometry_id']}" for i, d in enumerate(designs)]
     metrics = ["torque", "efficiency", "power_factor", "ripple"]
     titles = ["Torque (N.m)", "Efficiency (%)", "Power Factor", "Ripple (%)"]
     colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.patch.set_facecolor("#FFFFFF")
     fig.suptitle("Top Optimized Motor Designs vs Targets", fontsize=16, fontweight="bold", y=0.95)
-    
+
     for ax, metric, title, color in zip(axes.flatten(), metrics, titles, colors):
         values = [d["predicted_outputs"][metric] for d in designs]
         target_val = targets[metric]
-        
+
         x = np.arange(len(labels))
         bars = ax.bar(x, values, color=color, alpha=0.8, edgecolor="black", linewidth=0.5)
-        
+
         ax.axhline(target_val, color="black", linestyle="--", linewidth=2, label=f"Target: {target_val}")
-        
+
         ax.set_title(title, fontweight="bold", pad=10)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=0, fontsize=8)
         ax.legend(loc="best", fontsize=9)
         ax.grid(axis='y', alpha=0.3, color="#E5E5E5")
         ax.set_facecolor("#FFFFFF")
-        
+
         for bar in bars:
             yval = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, yval + (target_val*0.01), f"{yval:.2f}", 
+            ax.text(bar.get_x() + bar.get_width()/2, yval + (target_val*0.01), f"{yval:.2f}",
                     ha='center', va='bottom', fontsize=9, fontweight='bold')
-            
+
     for spine in ax.spines.values(): spine.set_edgecolor("#E5E5E5")
-    
+
     fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(plot_path, dpi=300, bbox_inches="tight", facecolor="#FFFFFF")
     plt.close(fig)
@@ -629,7 +673,7 @@ def save_decision_dashboard(strict_designs, soft_designs, targets, plot_path, to
         "Points closer to the target star and greener in color\n(lower ripple) with larger size (higher power factor)\nare preferred.")
     axHB = fig.add_subplot(outer[1, 1])
     style_how_to_read(axHB, "#1565C0",
-        "Lower match score means closer to the target across\nall objectives (Torque, Efficiency, Power Factor, Ripple).")
+        "Lower match score means closer to all targets simultaneously\n(Torque, Efficiency, Power Factor, Ripple).")
     axHC = fig.add_subplot(outer[1, 2])
     style_how_to_read(axHC, "#B8860B",
         f"These top {top_n} designs provide the best overall balance\nbetween torque, efficiency, power factor, and ripple.")
@@ -1066,13 +1110,13 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
 
     with open(bounds_file, 'r') as f: bounds = json.load(f)
     with open(metric_path, 'r') as f: all_metrics = json.load(f)
-    
+
     # --- BULLETPROOF BOUNDS FIX (Prevents the TypeError Crash) ---
     if isinstance(bounds.get('lb'), dict):
         bounds['lb'] = [float(bounds['lb'][k]) for k in sorted(bounds['lb'].keys(), key=lambda x: int(x))]
     if isinstance(bounds.get('ub'), dict):
         bounds['ub'] = [float(bounds['ub'][k]) for k in sorted(bounds['ub'].keys(), key=lambda x: int(x))]
-    
+
     # ---> ADDED: ENHANCED BOUNDS UNDERSTANDING & VALIDATION <---
     # 1. Fallback to list and enforce float types in case JSON provided raw lists with strings/ints
     if isinstance(bounds.get('lb'), list):
@@ -1092,17 +1136,17 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
             bounds['lb'][b_idx], bounds['ub'][b_idx] = bounds['ub'][b_idx], bounds['lb'][b_idx]
         if bounds['lb'][b_idx] == bounds['ub'][b_idx]:
             # Provide a microscopic search space so Pymoo doesn't crash on identical bounds
-            bounds['ub'][b_idx] += 1e-6  
+            bounds['ub'][b_idx] += 1e-6
     # -----------------------------------------------------------
 
     var_names = bounds.get('var_names', [f"x{i+1}" for i in range(len(bounds['lb']))])
-    
-    stator_in_idx = -1
-    rotor_out_idx = -1
-    for i, n in enumerate(var_names):
-        if "Stator::Inner" in str(n): stator_in_idx = i
-        elif "Rotor::Outer" in str(n): rotor_out_idx = i
-    
+
+    # ---> FIXED: delegate to the shared, tolerant lookup (matches
+    # train.py's column detection AND HybridMotorProblemVec's lookup)
+    # instead of a local "::"-only check that missed the space-separated
+    # "Stator Inner" / "Rotor Outer" label form. <---
+    stator_in_idx, rotor_out_idx = _find_airgap_indices(var_names)
+
     geom_metrics = next((m for m in all_metrics if m["geometry_id"] == gid), None)
     if not geom_metrics: return None
 
@@ -1129,35 +1173,54 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
             'observed_max_diametric': 1.4,
         }
 
+    if airgap_info is not None and (stator_in_idx == -1 or rotor_out_idx == -1):
+        print(f"\n[!] WARNING ({gid}): airgap_info is present in bounds.json but the Stator Inner / "
+              f"Rotor Outer columns could not be located among var_names -- airgap enforcement will be "
+              f"skipped for this geometry. Check that var_names still contains a 'Stator Inner'/'Stator::Inner' "
+              f"and 'Rotor Outer'/'Rotor::Outer' column.")
+
     # ---> USER-DEFINED MANUFACTURABLE AIRGAP RANGE <---
     # --airgap_min/--airgap_max let the user narrow (or shift) the gap NSGA-II
     # is allowed to choose, to whatever range their manufacturing process can
     # actually hold -- without ever letting it explore a gap the AI was never
     # trained on. Only meaningful when this geometry's data spans a real range
     # (is_fixed=False); a fixed-gap geometry only has one number to give.
+    #
+    # IMPORTANT UNIT FIX: the CLI (--airgap_min/--airgap_max) is specified by
+    # the user in RADIAL mm -- the actual physical/mechanical airgap,
+    # (Stator Inner - Rotor Outer) / 2. Everything stored in airgap_info
+    # (observed_mean_diametric / observed_min_diametric / observed_max_diametric)
+    # and everything enforce_airgap() operates on is DIAMETRIC
+    # (Stator Inner - Rotor Outer), i.e. exactly 2x the radial value. The two
+    # must never be compared directly -- previously the raw radial CLI values
+    # were clipped straight into the diametric observed range, silently
+    # halving the airgap the user actually got. Convert radial -> diametric
+    # here, once, before any clipping happens.
     if airgap_range is not None:
-        req_min, req_max = airgap_range
+        req_min_radial, req_max_radial = airgap_range
+        req_min, req_max = req_min_radial * 2.0, req_max_radial * 2.0
         if airgap_info is None:
             print(f"\n[!] WARNING ({gid}): no airgap relationship found in bounds.json — "
                   f"--airgap_min/--airgap_max ignored.")
         elif airgap_info['is_fixed']:
             print(f"\n[!] WARNING ({gid}): training data only contains a single observed airgap "
-                  f"({airgap_info['observed_mean_diametric']:.3f}mm diametric); the AI has never seen "
+                  f"({airgap_info['observed_mean_diametric']/2.0:.3f}mm radial); the AI has never seen "
                   f"a range, so --airgap_min/--airgap_max can't be honored without retraining on varied-gap "
-                  f"data. Using the fixed {airgap_info['observed_mean_diametric']:.3f}mm gap instead.")
+                  f"data. Using the fixed {airgap_info['observed_mean_diametric']/2.0:.3f}mm radial gap instead.")
         else:
             obs_min = airgap_info['observed_min_diametric']
             obs_max = airgap_info['observed_max_diametric']
             eff_min = max(req_min, obs_min)
             eff_max = min(req_max, obs_max)
             if eff_min > eff_max:
-                print(f"\n[!] WARNING ({gid}): requested airgap range [{req_min}, {req_max}]mm doesn't "
-                      f"overlap what the AI was trained on ([{obs_min:.3f}, {obs_max:.3f}]mm). "
-                      f"Falling back to the full observed range.")
+                print(f"\n[!] WARNING ({gid}): requested radial airgap range [{req_min_radial}, {req_max_radial}]mm "
+                      f"(diametric [{req_min:.3f}, {req_max:.3f}]mm) doesn't overlap what the AI was trained on "
+                      f"([{obs_min/2.0:.3f}, {obs_max/2.0:.3f}]mm radial). Falling back to the full observed range.")
             else:
                 if eff_min > req_min or eff_max < req_max:
-                    print(f"\n[i] ({gid}): clipping requested airgap range [{req_min}, {req_max}]mm to what "
-                          f"the AI has actually seen -> [{eff_min:.3f}, {eff_max:.3f}]mm diametric.")
+                    print(f"\n[i] ({gid}): clipping requested radial airgap range [{req_min_radial}, {req_max_radial}]mm "
+                          f"to what the AI has actually seen -> [{eff_min/2.0:.3f}, {eff_max/2.0:.3f}]mm radial "
+                          f"(diametric [{eff_min:.3f}, {eff_max:.3f}]mm).")
                 airgap_info = dict(airgap_info)
                 airgap_info['observed_min_diametric'] = eff_min
                 airgap_info['observed_max_diametric'] = eff_max
@@ -1181,7 +1244,7 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
     res = minimize(problem, algorithm, ('n_gen', n_gen), seed=42, verbose=False)
 
     valid_designs, soft_designs = [], []
-    
+
     if res.X is not None:
         X_val = np.atleast_2d(res.X)
         F_val = np.atleast_2d(res.F)
@@ -1189,7 +1252,7 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
 
         feasible = (CV <= 0).flatten()
         targets_arr = np.array([targets[k] for k in problem.active_keys])
-        
+
         if np.any(feasible):
             X_feas, F_feas = X_val[feasible], F_val[feasible]
             I = NonDominatedSorting().do(F_feas, only_non_dominated_front=True)
@@ -1231,26 +1294,26 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
                 "score": float(scores[idx]),
                 "winners": winners
             })
-            
+
     return {"strict": valid_designs, "soft": soft_designs}
 
 # ── 5. CLI setup ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="NSGA-II Motor Geometry Optimizer (Strict 0.7mm Airgap Edition)")
-    
+
     parser.add_argument("--torque",          type=float, default=None,  help="Target torque (N.m)")
     parser.add_argument("--efficiency",      type=float, default=None,  help="Target efficiency (%%)")
     parser.add_argument("--power_factor",    type=float, default=None,  help="Target power factor")
     parser.add_argument("--ripple",          type=float, default=None,  help="Target ripple (%%)")
-    
+
     parser.add_argument("--torque_tol",      type=float, default=2.0,   help="Strict torque tolerance")
     parser.add_argument("--efficiency_tol",  type=float, default=0.5,   help="Strict efficiency tolerance")
     parser.add_argument("--power_factor_tol",type=float, default=0.02,  help="Strict PF tolerance")
     parser.add_argument("--ripple_tol",      type=float, default=3.0,   help="Strict ripple tolerance")
-    
-    parser.add_argument("--airgap_min",      type=float, default=None,  help="Minimum DIAMETRIC airgap (mm) you can manufacture. Only honored for geometries whose training data spans a real airgap range (is_fixed=False); clipped to what the AI has actually seen.")
-    parser.add_argument("--airgap_max",      type=float, default=None,  help="Maximum DIAMETRIC airgap (mm) you can manufacture. Must be used together with --airgap_min.")
+
+    parser.add_argument("--airgap_min",      type=float, default=None,  help="Minimum RADIAL (physical, mechanical) airgap (mm) you can manufacture -- i.e. (Stator Inner - Rotor Outer)/2. Internally converted to diametric before comparing against training data. Only honored for geometries whose training data spans a real airgap range (is_fixed=False); clipped to what the AI has actually seen.")
+    parser.add_argument("--airgap_max",      type=float, default=None,  help="Maximum RADIAL (physical, mechanical) airgap (mm) you can manufacture. Must be used together with --airgap_min.")
 
     parser.add_argument("--top_n",           type=int,   default=5,     help="Number of final geometries to output")
     parser.add_argument("--n_designs",       type=int,   default=10,     help="Designs extracted per scenario")
@@ -1281,23 +1344,23 @@ def main():
     base = Path(__file__).parent
     model_dir = base / "models"
     res_dir   = base / "results"
-    
+
     out_dir   = res_dir / "designs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     targets = {}
     tols = {}
-    
-    if args.torque is not None:       
+
+    if args.torque is not None:
         targets["torque"] = args.torque
         tols["torque"] = args.torque_tol
-    if args.efficiency is not None:   
+    if args.efficiency is not None:
         targets["efficiency"] = args.efficiency
         tols["efficiency"] = args.efficiency_tol
-    if args.power_factor is not None: 
+    if args.power_factor is not None:
         targets["power_factor"] = args.power_factor
         tols["power_factor"] = args.power_factor_tol
-    if args.ripple is not None:       
+    if args.ripple is not None:
         targets["ripple"] = args.ripple
         tols["ripple"] = args.ripple_tol
 
@@ -1309,10 +1372,10 @@ def main():
     print("=" * 60)
     print("  MOTOR GEOMETRY — HYBRID NSGA-II OPTIMIZER")
     print("=" * 60)
-    
+
     target_strs = [f"{k.capitalize()}={v}" for k, v in targets.items()]
     tol_strs = [f"±{v}" for v in tols.values()]
-    
+
     print(f"\nTargets   : {', '.join(target_strs)}")
     print(f"Tolerances: {', '.join(tol_strs)}")
     print(f"Geometries to evaluate: {len(geoms)}\n")
@@ -1323,7 +1386,7 @@ def main():
     for i, bounds_file in enumerate(geoms, 1):
         gid = bounds_file.stem.replace("_bounds", "")
         print(f"\r  [Optimizing geometry {i:>2}/{len(geoms)}] : {gid} ...", end="", flush=True)
-        
+
         results = optimize_geometry(
             gid, model_dir, res_dir, targets, tols,
             args.n_designs, args.pop_size, args.n_gen, airgap_range
@@ -1333,15 +1396,15 @@ def main():
 
         for d in results["strict"]:
             strict_designs.append({"geometry_id": gid, **d})
-            
+
         for d in results["soft"]:
             soft_designs.append({"geometry_id": gid, **d})
 
     print("\n\n" + "=" * 80)
-    
+
     # ── SELECT TOP UNIQUE DESIGNS ──
     top_unique = []
-    
+
     if strict_designs:
         print(f"  🏆 TOP {args.top_n} GEOMETRIES (STRICTLY WITHIN USER BOUNDS)")
         strict_designs.sort(key=lambda x: x["score"])
@@ -1370,15 +1433,15 @@ def main():
         o = d['predicted_outputs']
         w = d['winners']
         print(f"  PERFORMANCE : Torque = {o['torque']:.2f} N.m  |  Eff = {o['efficiency']:.2f}%  |  PF = {o['power_factor']:.3f}  |  Ripple = {o['ripple']:.2f}%")
-        
+
         print("\n  DIMENSIONS:")
-        
+
         clean_names = [clean_var_name(name) for name in d['var_names']]
         max_vlen = max((len(name) for name in clean_names), default=3)
-        
+
         for v_name, v_val in zip(clean_names, d['input_values']):
             print(f"         {v_name:<{max_vlen}} = {v_val:.4f}")
-            
+
         print(f"\n  MODELS USED : Torque({w['y1'][:3]}), Eff({w['y2'][:3]}), PF({w['y3'][:3]}), Ripple({w['y4'][:3]})")
 
     # ── EXPORT TO EXCEL & PLOT ──
