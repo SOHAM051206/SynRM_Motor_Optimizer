@@ -2,6 +2,10 @@
 utils/data_parser.py
 Parses HyperStudy .data files using explicit mapping headers.
 Retains actual physical variable names (T1A, VA, etc.) for AI models and export.
+
+This module does not convert airgap units. It preserves the raw physical
+dimensions exactly as exported so train.py and optimize.py can apply the same
+radial-airgap logic consistently downstream.
 """
 
 import re
