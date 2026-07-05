@@ -1,9 +1,9 @@
 """
 optimize.py
-Hybrid Surrogate NSGA-II Optimizer (Strict 0.7mm Airgap Edition)
+Hybrid Surrogate NSGA-II Optimizer (Radial Airgap Edition)
 - Dynamically selects best models (XGBoost/CatBoost)
-- Strictly forces AI input to 0.0 to prevent extrapolation hallucinations
-- Strictly forces Output Geometry to Stator Inner - 1.4 (0.7mm radial airgap)
+- Uses radial airgap everywhere: Rotor Outer = Stator Inner - 2 × airgap_radial
+- Supports fixed-gap and variable-gap geometries without hardcoded 1.4 mm diametric assumptions
 - Includes Hyper-Resilient JSON parser to prevent bounds TypeErrors
 """
 
@@ -56,33 +56,50 @@ def _find_airgap_indices(var_names):
     Resolves the Stator Inner / Rotor Outer column names into integer
     positions within var_names, using the SAME lookup (find_stator_rotor_names,
     shared with train.py) that generated airgap_info in the first place.
-
-    Previously this file re-implemented the lookup twice, independently, and
-    both copies only matched the "Stator::Inner" / "Rotor::Outer" (double
-    colon) form -- NOT the "Stator Inner" / "Rotor Outer" (space) form that
-    train.py's own detector explicitly supports. If a dataset's relabeled
-    columns used the space form, train.py would still write a valid,
-    non-null airgap_info block into {gid}_bounds.json, but both places in
-    this file that needed to actually USE it (HybridMotorProblemVec.__init__
-    and optimize_geometry) would fail to find the columns, leaving
-    stator_in_idx / rotor_out_idx at -1. enforce_airgap() silently no-ops
-    whenever either index is -1, so airgap enforcement would be dead for
-    that geometry with no error or warning printed anywhere -- the exported
-    "strictly enforced" designs would never have had their rotor outer
-    diameter snapped to the trained relationship at all.
-
-    Centralizing the lookup here (delegating to the same helper train.py
-    uses) means both files can never disagree about which column is which.
-
-    Returns:
-        (stator_idx, rotor_idx) -- either is -1 if the corresponding column
-        wasn't found among var_names.
     """
     var_names = list(var_names)
     stator_name, rotor_name = find_stator_rotor_names(var_names)
     stator_idx = var_names.index(stator_name) if stator_name is not None else -1
     rotor_idx = var_names.index(rotor_name) if rotor_name is not None else -1
     return stator_idx, rotor_idx
+
+
+def _normalize_airgap_info(airgap_info):
+    """
+    Normalizes airgap metadata into radial mm keys.
+
+    Accepts either the new radial schema or older diametric-schema bounds.json
+    files and returns a consistent radial representation for the rest of the
+    optimizer.
+    """
+    if not airgap_info:
+        return None
+
+    info = dict(airgap_info)
+
+    if all(k in info for k in ("observed_min_radial", "observed_max_radial", "observed_mean_radial")):
+        info["observed_min_diametric"] = float(info["observed_min_radial"]) * 2.0
+        info["observed_max_diametric"] = float(info["observed_max_radial"]) * 2.0
+        info["observed_mean_diametric"] = float(info["observed_mean_radial"]) * 2.0
+        if "is_fixed" not in info:
+            info["is_fixed"] = abs(float(info["observed_max_radial"]) - float(info["observed_min_radial"])) < 1e-12
+        return info
+
+    if any(k in info for k in ("observed_min_diametric", "observed_max_diametric", "observed_mean_diametric")):
+        min_d = float(info.get("observed_min_diametric", info.get("observed_mean_diametric", 0.0)))
+        max_d = float(info.get("observed_max_diametric", info.get("observed_mean_diametric", 0.0)))
+        mean_d = float(info.get("observed_mean_diametric", 0.5 * (min_d + max_d)))
+        return {
+            "is_fixed": bool(info.get("is_fixed", abs(max_d - min_d) < 1e-12)),
+            "observed_min_radial": min_d / 2.0,
+            "observed_max_radial": max_d / 2.0,
+            "observed_mean_radial": mean_d / 2.0,
+            "observed_min_diametric": min_d,
+            "observed_max_diametric": max_d,
+            "observed_mean_diametric": mean_d,
+        }
+
+    return None
 
 
 def manifold_distance(x, mean, std, nn_index, k):
@@ -99,58 +116,59 @@ def manifold_distance(x, mean, std, nn_index, k):
     return dists[:, -1]
 
 
-def enforce_airgap(x, stator_idx, rotor_idx, airgap_info):
+def enforce_airgap(x, stator_idx, rotor_idx, airgap_info, airgap_radial=None):
     """
-    Forces the Rotor::Outer column to respect the airgap that was ACTUALLY
-    observed in the training data, instead of a hardcoded 1.4mm.
-
-    - airgap_info is None / missing       -> no relationship known, leave x untouched.
-    - airgap_info['is_fixed'] is True      -> the AI has only ever seen ~one gap
-                                               (e.g. 0.7mm radial today). Lock onto the
-                                               measured mean gap. Retrain with a
-                                               different fixed gap later and this
-                                               adapts automatically, no code change.
-    - airgap_info['is_fixed'] is False     -> the data spans a real range of gaps.
-                                               Don't collapse to one number: clip the
-                                               *requested* gap into the observed
-                                               [min, max] range so NSGA-II can explore
-                                               variable airgaps without extrapolating
-                                               past what the AI was trained on.
-
-    NOTE: all values in airgap_info (observed_mean_diametric,
-    observed_min_diametric, observed_max_diametric) are DIAMETRIC
-    (Stator Inner - Rotor Outer), i.e. exactly twice the physical/mechanical
-    RADIAL airgap. Any radial-facing values (e.g. user CLI input) must be
-    converted to diametric (multiplied by 2) BEFORE they reach this function
-    or airgap_info -- this function itself only ever operates in diametric
-    space, consistent with how it was measured from the training data.
-
-    Critically: this is called ONCE, identically, both during NSGA-II's internal
-    evaluation and during final design export, so the performance numbers you see
-    always correspond to the geometry you actually get (previously the code zeroed
-    rotor_out for prediction, then silently changed it afterward for export -- two
-    different geometries, only one of which was ever actually evaluated).
+    Enforces the stator-inner / rotor-outer relationship in RADIAL mm.
+    Rotor Outer is always reconstructed as Stator Inner - 2 × airgap_radial.
     """
-    if stator_idx == -1 or rotor_idx == -1 or not airgap_info:
+    x = np.array(x, copy=True)
+
+    if stator_idx == -1 or rotor_idx == -1:
         return x
 
-    if airgap_info['is_fixed']:
-        gap = airgap_info['observed_mean_diametric']
-        x[..., rotor_idx] = x[..., stator_idx] - gap
+    if airgap_radial is not None:
+        radial = np.asarray(airgap_radial, dtype=float)
+
+        if x.ndim == 1:
+            x[rotor_idx] = x[stator_idx] - 2.0 * float(np.ravel(radial)[0])
+        else:
+            radial = np.ravel(radial)
+            if radial.size == 1 and x.shape[0] > 1:
+                radial = np.full(x.shape[0], float(radial[0]))
+            x[:, rotor_idx] = x[:, stator_idx] - 2.0 * radial
+        return x
+
+    info = _normalize_airgap_info(airgap_info)
+    if info is None:
+        return x
+
+    if info.get("is_fixed", False):
+        gap = float(info["observed_mean_radial"])
+        if x.ndim == 1:
+            x[rotor_idx] = x[stator_idx] - 2.0 * gap
+        else:
+            x[:, rotor_idx] = x[:, stator_idx] - 2.0 * gap
     else:
-        gmin = airgap_info['observed_min_diametric']
-        gmax = airgap_info['observed_max_diametric']
-        requested_gap = x[..., stator_idx] - x[..., rotor_idx]
-        clipped_gap = np.clip(requested_gap, gmin, gmax)
-        x[..., rotor_idx] = x[..., stator_idx] - clipped_gap
+        gmin = float(info["observed_min_radial"])
+        gmax = float(info["observed_max_radial"])
+        if x.ndim == 1:
+            requested_gap = (x[stator_idx] - x[rotor_idx]) / 2.0
+            clipped_gap = float(np.clip(requested_gap, gmin, gmax))
+            x[rotor_idx] = x[stator_idx] - 2.0 * clipped_gap
+        else:
+            requested_gap = (x[:, stator_idx] - x[:, rotor_idx]) / 2.0
+            clipped_gap = np.clip(requested_gap, gmin, gmax)
+            x[:, rotor_idx] = x[:, stator_idx] - 2.0 * clipped_gap
 
     return x
 
 
 # ── 2. Vectorized Problem Definition ─────────────────────────────────────────
+# ── 2. Vectorized Problem Definition ─────────────────────────────────────────
 
 class HybridMotorProblemVec(Problem):
-    def __init__(self, cat_model, xgb_model, winners, bounds, targets, config, var_names, airgap_info=None, manifold=None, radial_depth_budget=None):
+    def __init__(self, cat_model, xgb_model, winners, bounds, targets, config, var_names,
+                 airgap_info=None, manifold=None, radial_depth_budget=None, airgap_var_idx=None):
         self.active_keys = list(targets.keys())
 
         # ---> FIXED: delegate to the shared, tolerant lookup (matches
@@ -158,6 +176,7 @@ class HybridMotorProblemVec(Problem):
         self.stator_in_idx, self.rotor_out_idx = _find_airgap_indices(var_names)
 
         self.airgap_info = airgap_info
+        self.airgap_var_idx = airgap_var_idx  # decision slot used as the explicit radial-airgap variable, if enabled
 
         self.manifold = manifold
         n_extra_constr = 0
@@ -202,16 +221,31 @@ class HybridMotorProblemVec(Problem):
         F_list = []
         G_list = []
 
-        # ---> DATA-DRIVEN AIRGAP ENFORCEMENT <---
-        # Instead of zeroing rotor_out (which fed the model an input it never
-        # saw in training and caused unreliable, out-of-distribution predictions),
-        # snap rotor_out into the airgap relationship actually observed in the
-        # training data. Same function is used at export time, so what gets
-        # predicted here is exactly the geometry that gets reported later.
-        x = enforce_airgap(x, self.stator_in_idx, self.rotor_out_idx, self.airgap_info)
+        x_eval = np.array(x, copy=True)
 
-        cat_preds = self.cat_model.predict(x)
-        xgb_preds = self.xgb_model.predict(x)
+        # ---> REAL AIRGAP DECISION VARIABLE MODE <---
+        # When airgap_var_idx is enabled, the optimizer is directly searching
+        # the airgap decision. The value in that slot is interpreted as RADIAL
+        # airgap (mm), then Rotor::Outer is rebuilt from Stator::Inner - 2*gap.
+        if self.airgap_var_idx is not None:
+            airgap_radial = x_eval[:, self.airgap_var_idx].copy()
+            x_eval = enforce_airgap(
+                x_eval,
+                self.stator_in_idx,
+                self.rotor_out_idx,
+                None,
+                airgap_radial=airgap_radial
+            )
+        else:
+            airgap_radial = None
+            x_eval = enforce_airgap(x_eval, self.stator_in_idx, self.rotor_out_idx, self.airgap_info)
+
+        # Prediction must always see the actual geometry, not a clipped or
+        # post-processed surrogate input.
+        x_model = x_eval
+
+        cat_preds = self.cat_model.predict(x_model)
+        xgb_preds = self.xgb_model.predict(x_model)
 
         if cat_preds.ndim == 1: cat_preds = cat_preds.reshape(1, -1)
         if xgb_preds.ndim == 1: xgb_preds = xgb_preds.reshape(1, -1)
@@ -231,31 +265,18 @@ class HybridMotorProblemVec(Problem):
             G_list.append(g_upper)
 
         # ---> NON-CONVEX MANIFOLD FEASIBILITY CONSTRAINT <---
-        # Beyond each objective's own bound, reject any candidate whose overall
-        # variable COMBINATION (T1A, T2, TM1A, TM2A, VA, control angle, etc.)
-        # sits too far from its nearest real, successful neighbors. This
-        # follows the true (possibly curved/non-convex) shape of the feasible
-        # design region, catching "every variable individually in range, but
-        # this exact combination falls in a gap between real designs" cases
-        # -- e.g. sketch self-intersections like LINE_P7A_PS3 / LINE_P4A_P2A.
+        # The manifold is evaluated in the model feature space, which already
+        # contains the reconstructed rotor outer diameter.
         if self.manifold is not None:
-            dist = manifold_distance(x, self.mf_mean, self.mf_std, self.mf_nn_index, self.mf_k)
+            dist = manifold_distance(x_model, self.mf_mean, self.mf_std, self.mf_nn_index, self.mf_k)
             g_manifold = dist - self.mf_threshold
             G_list.append(g_manifold)
 
         # ---> RADIAL DEPTH BUDGET CONSTRAINT <---
-        # Direct, explicit check for the mechanism behind 'Rotor Inner
-        # diameter too large -> barriers don't fit -> lines intersect':
-        # available radial depth = (Rotor Outer - Rotor Inner) / 2 must stay
-        # large enough, RELATIVE TO the total size of the barrier dimensions
-        # actually being requested, to match the tightest margin any real
-        # design ever validated. Checked directly (not diffused across many
-        # other dimensions the way the manifold distance is), so it catches
-        # this specific failure even in higher-dimensional geometries (D03+)
-        # where the manifold check alone can miss it.
+        # Evaluated on the actual enforced geometry.
         if self.radial_depth_budget is not None:
-            available_depth = (x[:, self.rdb_outer_idx] - x[:, self.rdb_inner_idx]) / 2.0
-            total_barrier = x[:, self.rdb_barrier_idx].sum(axis=1)
+            available_depth = (x_eval[:, self.rdb_outer_idx] - x_eval[:, self.rdb_inner_idx]) / 2.0
+            total_barrier = x_eval[:, self.rdb_barrier_idx].sum(axis=1)
             g_radial = self.rdb_min_ratio * total_barrier - available_depth
             G_list.append(g_radial)
 
@@ -276,6 +297,8 @@ def flatten_designs(designs_list):
             "Power Factor": d["predicted_outputs"]["power_factor"],
             "Ripple (%)": d["predicted_outputs"]["ripple"],
         }
+        if d.get("airgap_radial_mm") is not None:
+            row["Airgap Radial (mm)"] = d["airgap_radial_mm"]
 
         for name, val in zip(d["var_names"], d["input_values"]):
             clean_name = clean_var_name(name)
@@ -1108,8 +1131,10 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
     if not all(p.exists() for p in [bounds_file, cat_path, xgb_path, metric_path]):
         return None
 
-    with open(bounds_file, 'r') as f: bounds = json.load(f)
-    with open(metric_path, 'r') as f: all_metrics = json.load(f)
+    with open(bounds_file, 'r') as f:
+        bounds = json.load(f)
+    with open(metric_path, 'r') as f:
+        all_metrics = json.load(f)
 
     # --- BULLETPROOF BOUNDS FIX (Prevents the TypeError Crash) ---
     if isinstance(bounds.get('lb'), dict):
@@ -1148,7 +1173,8 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
     stator_in_idx, rotor_out_idx = _find_airgap_indices(var_names)
 
     geom_metrics = next((m for m in all_metrics if m["geometry_id"] == gid), None)
-    if not geom_metrics: return None
+    if not geom_metrics:
+        return None
 
     winners = {}
     for yk in ["y1", "y2", "y3", "y4"]:
@@ -1160,70 +1186,60 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
     cat_model.load_model(str(cat_path))
     xgb_model = joblib.load(str(xgb_path))
 
-    # ---> DATA-DRIVEN AIRGAP <---
-    # Read whatever train.py actually measured in the data for this geometry.
-    # If this bounds.json predates the train.py update (no 'airgap_info' key),
-    # fall back to today's known fixed 0.7mm radial gap so old runs don't break.
-    airgap_info = bounds.get('airgap_info')
+    # Keep a working copy of the bounds so any explicit airgap search only
+    # affects this run, not the JSON on disk.
+    runtime_bounds = {
+        "lb": list(bounds["lb"]),
+        "ub": list(bounds["ub"]),
+    }
+
+    # ---> REAL OPTIMIZED AIRGAP VARIABLE <---
+    # If the user provides --airgap_min/--airgap_max, the optimizer searches
+    # that interval directly in RADIAL mm. The rotor-outer position is used as
+    # the airgap decision slot during optimization, then reconstructed into the
+    # actual geometry before evaluation/export.
+    airgap_var_idx = None
+    if airgap_range is not None:
+        req_min_radial, req_max_radial = airgap_range
+
+        if stator_in_idx == -1 or rotor_out_idx == -1:
+            print(f"\n[!] WARNING ({gid}): could not locate Stator Inner / Rotor Outer columns. "
+                  f"--airgap_min/--airgap_max cannot be applied as an optimized decision variable.")
+        else:
+            airgap_var_idx = rotor_out_idx
+            runtime_bounds["lb"][airgap_var_idx] = float(req_min_radial)
+            runtime_bounds["ub"][airgap_var_idx] = float(req_max_radial)
+
+            airgap_info = _normalize_airgap_info(bounds.get("airgap_info"))
+            if airgap_info is not None:
+                if airgap_info.get("is_fixed", False):
+                    print(f"\n[!] WARNING ({gid}): training data was fixed-gap, but explicit airgap "
+                          f"optimization is enabled over [{req_min_radial:.3f}, {req_max_radial:.3f}] mm radial. "
+                          f"This can extrapolate beyond the observed fixed radial gap.")
+                else:
+                    obs_min = float(airgap_info.get("observed_min_radial", req_min_radial))
+                    obs_max = float(airgap_info.get("observed_max_radial", req_max_radial))
+                    print(f"\n[i] ({gid}): optimizing radial airgap directly in [{req_min_radial:.3f}, "
+                          f"{req_max_radial:.3f}] mm.")
+                    print(f"    Training airgap span seen in data: [{obs_min:.3f}, {obs_max:.3f}] mm radial")
+            else:
+                print(f"\n[i] ({gid}): optimizing radial airgap directly in [{req_min_radial:.3f}, "
+                      f"{req_max_radial:.3f}] mm.")
+
+    # ---> DATA-DRIVEN AIRGAP FALLBACK <---
+    # If no explicit airgap range is provided, use the airgap relationship
+    # observed in training. If that metadata is absent, the optimizer still
+    # runs, but no hardcoded diameter assumption is injected.
+    airgap_info = _normalize_airgap_info(bounds.get('airgap_info'))
     if airgap_info is None and stator_in_idx != -1 and rotor_out_idx != -1:
-        airgap_info = {
-            'is_fixed': True,
-            'observed_mean_diametric': 1.4,
-            'observed_min_diametric': 1.4,
-            'observed_max_diametric': 1.4,
-        }
+        print(f"\n[!] WARNING ({gid}): no airgap metadata found in bounds.json; "
+              f"the optimizer will not force a radial gap unless --airgap_min/--airgap_max is provided.")
 
     if airgap_info is not None and (stator_in_idx == -1 or rotor_out_idx == -1):
         print(f"\n[!] WARNING ({gid}): airgap_info is present in bounds.json but the Stator Inner / "
               f"Rotor Outer columns could not be located among var_names -- airgap enforcement will be "
               f"skipped for this geometry. Check that var_names still contains a 'Stator Inner'/'Stator::Inner' "
               f"and 'Rotor Outer'/'Rotor::Outer' column.")
-
-    # ---> USER-DEFINED MANUFACTURABLE AIRGAP RANGE <---
-    # --airgap_min/--airgap_max let the user narrow (or shift) the gap NSGA-II
-    # is allowed to choose, to whatever range their manufacturing process can
-    # actually hold -- without ever letting it explore a gap the AI was never
-    # trained on. Only meaningful when this geometry's data spans a real range
-    # (is_fixed=False); a fixed-gap geometry only has one number to give.
-    #
-    # IMPORTANT UNIT FIX: the CLI (--airgap_min/--airgap_max) is specified by
-    # the user in RADIAL mm -- the actual physical/mechanical airgap,
-    # (Stator Inner - Rotor Outer) / 2. Everything stored in airgap_info
-    # (observed_mean_diametric / observed_min_diametric / observed_max_diametric)
-    # and everything enforce_airgap() operates on is DIAMETRIC
-    # (Stator Inner - Rotor Outer), i.e. exactly 2x the radial value. The two
-    # must never be compared directly -- previously the raw radial CLI values
-    # were clipped straight into the diametric observed range, silently
-    # halving the airgap the user actually got. Convert radial -> diametric
-    # here, once, before any clipping happens.
-    if airgap_range is not None:
-        req_min_radial, req_max_radial = airgap_range
-        req_min, req_max = req_min_radial * 2.0, req_max_radial * 2.0
-        if airgap_info is None:
-            print(f"\n[!] WARNING ({gid}): no airgap relationship found in bounds.json — "
-                  f"--airgap_min/--airgap_max ignored.")
-        elif airgap_info['is_fixed']:
-            print(f"\n[!] WARNING ({gid}): training data only contains a single observed airgap "
-                  f"({airgap_info['observed_mean_diametric']/2.0:.3f}mm radial); the AI has never seen "
-                  f"a range, so --airgap_min/--airgap_max can't be honored without retraining on varied-gap "
-                  f"data. Using the fixed {airgap_info['observed_mean_diametric']/2.0:.3f}mm radial gap instead.")
-        else:
-            obs_min = airgap_info['observed_min_diametric']
-            obs_max = airgap_info['observed_max_diametric']
-            eff_min = max(req_min, obs_min)
-            eff_max = min(req_max, obs_max)
-            if eff_min > eff_max:
-                print(f"\n[!] WARNING ({gid}): requested radial airgap range [{req_min_radial}, {req_max_radial}]mm "
-                      f"(diametric [{req_min:.3f}, {req_max:.3f}]mm) doesn't overlap what the AI was trained on "
-                      f"([{obs_min/2.0:.3f}, {obs_max/2.0:.3f}]mm radial). Falling back to the full observed range.")
-            else:
-                if eff_min > req_min or eff_max < req_max:
-                    print(f"\n[i] ({gid}): clipping requested radial airgap range [{req_min_radial}, {req_max_radial}]mm "
-                          f"to what the AI has actually seen -> [{eff_min/2.0:.3f}, {eff_max/2.0:.3f}]mm radial "
-                          f"(diametric [{eff_min:.3f}, {eff_max:.3f}]mm).")
-                airgap_info = dict(airgap_info)
-                airgap_info['observed_min_diametric'] = eff_min
-                airgap_info['observed_max_diametric'] = eff_max
 
     # ---> NON-CONVEX MANIFOLD FEASIBILITY CHECK <---
     # Present for any bounds.json regenerated with the updated train.py.
@@ -1238,7 +1254,19 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
     # extra constraint -- no crash, just no protection until you retrain.
     radial_depth_budget = bounds.get('radial_depth_budget')
 
-    problem = HybridMotorProblemVec(cat_model, xgb_model, winners, bounds, targets, tols, var_names, airgap_info, manifold, radial_depth_budget)
+    problem = HybridMotorProblemVec(
+        cat_model,
+        xgb_model,
+        winners,
+        runtime_bounds,
+        targets,
+        tols,
+        var_names,
+        airgap_info,
+        manifold,
+        radial_depth_budget,
+        airgap_var_idx=airgap_var_idx
+    )
     algorithm = NSGA2(pop_size=pop_size)
 
     res = minimize(problem, algorithm, ('n_gen', n_gen), seed=42, verbose=False)
@@ -1270,21 +1298,35 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
         for idx in best_idx:
             x_dsg = source_X[idx].copy()
 
-            # ---> DATA-DRIVEN AIRGAP, ENFORCED ONCE <---
-            # Same enforcement used inside NSGA-II's _evaluate. Doing it BEFORE
-            # prediction (and not changing it again afterward) guarantees the
-            # torque/efficiency/etc. reported below are for the exact geometry
-            # you get in the export -- previously this predicted with rotor_out
-            # forced to 0.0, then silently swapped in the real value afterward,
-            # so the reported numbers never matched the exported geometry.
-            x_dsg = enforce_airgap(x_dsg.reshape(1, -1), stator_in_idx, rotor_out_idx, airgap_info).flatten()
+            # Enforce the same geometry that was evaluated by the optimizer.
+            # If explicit airgap optimization is enabled, the decision slot is
+            # interpreted as a radial airgap, then converted to Rotor::Outer
+            # before prediction/export.
+            if airgap_var_idx is not None:
+                airgap_radial_mm = float(x_dsg[airgap_var_idx])
+                x_eval = enforce_airgap(
+                    x_dsg.reshape(1, -1),
+                    stator_in_idx,
+                    rotor_out_idx,
+                    None,
+                    airgap_radial=np.array([airgap_radial_mm], dtype=float)
+                ).flatten()
+            else:
+                airgap_radial_mm = None
+                x_eval = enforce_airgap(
+                    x_dsg.reshape(1, -1),
+                    stator_in_idx,
+                    rotor_out_idx,
+                    airgap_info
+                ).flatten()
 
-            c_pred = cat_model.predict(x_dsg.reshape(1, -1))[0]
-            x_pred = xgb_model.predict(x_dsg.reshape(1, -1))[0]
+            c_pred = cat_model.predict(x_eval.reshape(1, -1))[0]
+            x_pred = xgb_model.predict(x_eval.reshape(1, -1))[0]
 
             design_list.append({
                 "var_names": var_names,
-                "input_values": x_dsg.tolist(),
+                "input_values": x_eval.tolist(),
+                "airgap_radial_mm": airgap_radial_mm,
                 "predicted_outputs": {
                     "torque":       float(c_pred[0] if winners["y1"] == "CatBoost" else x_pred[0]),
                     "efficiency":   float(c_pred[1] if winners["y2"] == "CatBoost" else x_pred[1]),
@@ -1299,8 +1341,11 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
 
 # ── 5. CLI setup ─────────────────────────────────────────────────────────────
 
+
+# ── 5. CLI setup ─────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="NSGA-II Motor Geometry Optimizer (Strict 0.7mm Airgap Edition)")
+    parser = argparse.ArgumentParser(description="NSGA-II Motor Geometry Optimizer (Radial Airgap Edition)")
 
     parser.add_argument("--torque",          type=float, default=None,  help="Target torque (N.m)")
     parser.add_argument("--efficiency",      type=float, default=None,  help="Target efficiency (%%)")
@@ -1312,8 +1357,8 @@ def main():
     parser.add_argument("--power_factor_tol",type=float, default=0.02,  help="Strict PF tolerance")
     parser.add_argument("--ripple_tol",      type=float, default=3.0,   help="Strict ripple tolerance")
 
-    parser.add_argument("--airgap_min",      type=float, default=None,  help="Minimum RADIAL (physical, mechanical) airgap (mm) you can manufacture -- i.e. (Stator Inner - Rotor Outer)/2. Internally converted to diametric before comparing against training data. Only honored for geometries whose training data spans a real airgap range (is_fixed=False); clipped to what the AI has actually seen.")
-    parser.add_argument("--airgap_max",      type=float, default=None,  help="Maximum RADIAL (physical, mechanical) airgap (mm) you can manufacture. Must be used together with --airgap_min.")
+    parser.add_argument("--airgap_min",      type=float, default=None,  help="Minimum RADIAL (physical, mechanical) airgap (mm) to optimize over.")
+    parser.add_argument("--airgap_max",      type=float, default=None,  help="Maximum RADIAL (physical, mechanical) airgap (mm) to optimize over. Must be used together with --airgap_min.")
 
     parser.add_argument("--top_n",           type=int,   default=5,     help="Number of final geometries to output")
     parser.add_argument("--n_designs",       type=int,   default=10,     help="Designs extracted per scenario")
@@ -1441,6 +1486,9 @@ def main():
 
         for v_name, v_val in zip(clean_names, d['input_values']):
             print(f"         {v_name:<{max_vlen}} = {v_val:.4f}")
+
+        if d.get('airgap_radial_mm') is not None:
+            print(f"         {'Airgap Radial (mm)':<{max_vlen}} = {d['airgap_radial_mm']:.4f}")
 
         print(f"\n  MODELS USED : Torque({w['y1'][:3]}), Eff({w['y2'][:3]}), PF({w['y3'][:3]}), Ripple({w['y4'][:3]})")
 
