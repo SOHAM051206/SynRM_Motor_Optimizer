@@ -4,10 +4,10 @@ The Ultimate Engineering Showdown: XGBoost vs CatBoost
 Includes Global Scatter Plots, Side-by-Side Heatmaps, Local 1x4 Diagnostic Scatters,
 Grouped Feature Importance Bar Charts, Pearson Correlation Matrices, AND automatically generates the required _bounds.json files.
 
-Error reporting: MAPE has been removed entirely (it blows up near zero-valued
-actuals, which happens often with Torque/Efficiency near light-load points).
-Instead every place that used to report MAPE now reports MAE (native units),
+Error reporting: MAPE is reported alongside MAE (native units),
 WAPE (%), and sMAPE (%) -- see `_error_summary()` below.
+The MAPE implementation is epsilon-stabilized so it remains printable even
+when a few actual values are close to zero.
 """
 
 import argparse
@@ -85,6 +85,19 @@ def _wape(y_act: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sum(np.abs(y_act - y_pred)) / denom * 100.0)
 
 
+def _mape(y_act: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Mean Absolute Percentage Error (%).
+
+    This is the classical per-sample MAPE with a small epsilon guard to keep
+    the metric finite when actual values are exactly zero.
+    """
+    y_act = np.asarray(y_act, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.maximum(np.abs(y_act), eps)
+    return float(np.mean(np.abs(y_act - y_pred) / denom) * 100.0)
+
+
 def _smape(y_act: np.ndarray, y_pred: np.ndarray) -> float:
     """
     Symmetric Mean Absolute Percentage Error (%).
@@ -101,11 +114,12 @@ def _smape(y_act: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _error_summary(y_act: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Returns MAE (native units), WAPE (%), and sMAPE (%) for one prediction set."""
+    """Returns MAE (native units), MAPE (%), WAPE (%), and sMAPE (%) for one prediction set."""
     y_act  = np.asarray(y_act, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     return {
         "mae":   float(mean_absolute_error(y_act, y_pred)),
+        "mape":  _mape(y_act, y_pred),
         "wape":  _wape(y_act, y_pred),
         "smape": _smape(y_act, y_pred),
     }
@@ -114,16 +128,15 @@ def _error_summary(y_act: np.ndarray, y_pred: np.ndarray) -> dict:
 
 def _detect_airgap_info(X: pd.DataFrame, fixed_tol: float = 0.05) -> dict | None:
     """
-    Measures the ACTUAL airgap present in the training data (diametric:
-    Stator::Inner - Rotor::Outer) instead of assuming a hardcoded value.
+    Measures the ACTUAL airgap present in the training data in RADIAL mm,
+    computed as (Stator Inner - Rotor Outer) / 2.
 
     - If every sample in the data shows ~the same gap (spread < fixed_tol mm),
-      the AI has only ever seen that one airgap -> mark it 'fixed' so the
-      optimizer locks onto the measured value (auto-adapts if you retrain
-      with a different fixed gap later, e.g. 0.6mm instead of 0.7mm).
-    - If the data spans a real range of gaps, mark it 'variable' and record
-      the observed min/max so the optimizer can search within that range
-      instead of extrapolating beyond what the AI was actually trained on.
+      the geometry behaves like a fixed-gap design and the optimizer can lock
+      to that observed radial value.
+    - If the data spans a real range of gaps, the observed min/max radial
+      values are stored so the optimizer can search only within the trained
+      range instead of extrapolating.
 
     Column lookup is delegated to find_stator_rotor_names() (shared with
     optimize.py) so both files always agree on which column counts as the
@@ -135,23 +148,23 @@ def _detect_airgap_info(X: pd.DataFrame, fixed_tol: float = 0.05) -> dict | None
     if stator_col is None or rotor_col is None:
         return None
 
-    diametric_gap = (X[stator_col] - X[rotor_col]).astype(float)
-    g_min, g_max = float(diametric_gap.min()), float(diametric_gap.max())
-    g_mean = float(diametric_gap.mean())
+    radial_gap = ((X[stator_col] - X[rotor_col]) / 2.0).astype(float)
+    g_min, g_max = float(radial_gap.min()), float(radial_gap.max())
+    g_mean = float(radial_gap.mean())
     is_fixed = (g_max - g_min) < fixed_tol
 
     return {
         'stator_col': stator_col,
         'rotor_col': rotor_col,
         'is_fixed': bool(is_fixed),
-        'observed_min_diametric': g_min,
-        'observed_max_diametric': g_max,
-        'observed_mean_diametric': g_mean,
-        'observed_min_radial': g_min / 2.0,
-        'observed_max_radial': g_max / 2.0,
-        'observed_mean_radial': g_mean / 2.0,
+        'observed_min_radial': g_min,
+        'observed_max_radial': g_max,
+        'observed_mean_radial': g_mean,
+        # Legacy compatibility aliases retained for old JSON consumers.
+        'observed_min_diametric': g_min * 2.0,
+        'observed_max_diametric': g_max * 2.0,
+        'observed_mean_diametric': g_mean * 2.0,
     }
-
 
 def _fit_manifold(X: pd.DataFrame, k: int = 5, margin: float = 1.25) -> dict:
     """
@@ -260,7 +273,7 @@ def save_bounds(geom: dict, model_dir: Path):
         'ub': X.max(axis=0).values.tolist(),
         'var_names': list(X.columns),  # <-- Automatically captures T1A, VA, etc.
         'geometry_id': gid,
-        'airgap_info': _detect_airgap_info(X),         # data-driven, no hardcoded mm value
+        'airgap_info': _detect_airgap_info(X),         # data-driven radial gap, no hardcoded mm value
         'manifold': _fit_manifold(X),                    # data-driven, non-convex joint-feasibility check
         'radial_depth_budget': _fit_radial_depth_budget(X),  # data-driven rotor-depth vs barrier-size constraint
     }
@@ -342,12 +355,13 @@ def train_and_compare(geom: dict, model_dir: Path, plot_dir: Path, global_tracke
         
         winner = "CatBoost" if cat_r2 > xgb_r2 else ("XGBoost" if xgb_r2 > cat_r2 else "Tie")
         print(f"  {label:<{LABEL_W}} | {xgb_r2:>10.4f} | {cat_r2:>11.4f} | {winner}")
-        print(f"  {'':<{LABEL_W}} |   XGB -> MAE: {xgb_err['mae']:<10.4f} WAPE: {xgb_err['wape']:>6.2f}%   sMAPE: {xgb_err['smape']:>6.2f}%")
-        print(f"  {'':<{LABEL_W}} |   CAT -> MAE: {cat_err['mae']:<10.4f} WAPE: {cat_err['wape']:>6.2f}%   sMAPE: {cat_err['smape']:>6.2f}%")
+        print(f"  {'':<{LABEL_W}} |   XGB -> MAE: {xgb_err['mae']:<10.4f} MAPE: {xgb_err['mape']:>6.2f}%   WAPE: {xgb_err['wape']:>6.2f}%   sMAPE: {xgb_err['smape']:>6.2f}%")
+        print(f"  {'':<{LABEL_W}} |   CAT -> MAE: {cat_err['mae']:<10.4f} MAPE: {cat_err['mape']:>6.2f}%   WAPE: {cat_err['wape']:>6.2f}%   sMAPE: {cat_err['smape']:>6.2f}%")
         
         results["outputs"][oname] = {
             "xgb_r2": xgb_r2, "cat_r2": cat_r2,
             "xgb_mae": xgb_err["mae"], "cat_mae": cat_err["mae"],
+            "xgb_mape": xgb_err["mape"], "cat_mape": cat_err["mape"],
             "xgb_wape": xgb_err["wape"], "cat_wape": cat_err["wape"],
             "xgb_smape": xgb_err["smape"], "cat_smape": cat_err["smape"],
         }
@@ -781,8 +795,8 @@ def _print_final_verdict(global_tracker, out_dir):
         cat_err = _error_summary(y_act, cat_y)
 
         print(f"\n  {OUTPUT_NAMES[okey].upper()}:")
-        print(f"    XGBoost  -> R²: {xgb_r2:.4f} | MAE: {xgb_err['mae']:.4f} | WAPE: {xgb_err['wape']:.2f}% | sMAPE: {xgb_err['smape']:.2f}%")
-        print(f"    CatBoost -> R²: {cat_r2:.4f} | MAE: {cat_err['mae']:.4f} | WAPE: {cat_err['wape']:.2f}% | sMAPE: {cat_err['smape']:.2f}%")
+        print(f"    XGBoost  -> R²: {xgb_r2:.4f} | MAE: {xgb_err['mae']:.4f} | MAPE: {xgb_err['mape']:.2f}% | WAPE: {xgb_err['wape']:.2f}% | sMAPE: {xgb_err['smape']:.2f}%")
+        print(f"    CatBoost -> R²: {cat_r2:.4f} | MAE: {cat_err['mae']:.4f} | MAPE: {cat_err['mape']:.2f}% | WAPE: {cat_err['wape']:.2f}% | sMAPE: {cat_err['smape']:.2f}%")
         
         if cat_r2 > xgb_r2:
             cat_wins += 1
