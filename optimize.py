@@ -1206,25 +1206,45 @@ def optimize_geometry(gid, models_dir, res_dir, targets, tols, n_designs, pop_si
             print(f"\n[!] WARNING ({gid}): could not locate Stator Inner / Rotor Outer columns. "
                   f"--airgap_min/--airgap_max cannot be applied as an optimized decision variable.")
         else:
-            airgap_var_idx = rotor_out_idx
-            runtime_bounds["lb"][airgap_var_idx] = float(req_min_radial)
-            runtime_bounds["ub"][airgap_var_idx] = float(req_max_radial)
+            # ---> PER-GEOMETRY GATE <---
+            # Whether THIS geometry's own training data is fixed-gap or
+            # variable-gap decides how --airgap_min/--airgap_max is used for
+            # it. A CLI range is a request to search an airgap interval; it
+            # is only meaningful for geometries whose surrogate models
+            # actually saw a variable airgap during training. For a
+            # fixed-gap geometry there is nothing to search -- the model
+            # was never trained on any other gap -- so it is pinned to its
+            # observed fixed radial gap instead of letting NSGA-II roam the
+            # requested interval and silently extrapolate. This lets a
+            # single run mix fixed-gap and variable-gap geometries
+            # correctly instead of forcing one behavior on both.
+            pre_airgap_info = _normalize_airgap_info(bounds.get("airgap_info"))
+            geometry_is_fixed = bool(pre_airgap_info and pre_airgap_info.get("is_fixed", False))
 
-            airgap_info = _normalize_airgap_info(bounds.get("airgap_info"))
-            if airgap_info is not None:
-                if airgap_info.get("is_fixed", False):
-                    print(f"\n[!] WARNING ({gid}): training data was fixed-gap, but explicit airgap "
-                          f"optimization is enabled over [{req_min_radial:.3f}, {req_max_radial:.3f}] mm radial. "
-                          f"This can extrapolate beyond the observed fixed radial gap.")
-                else:
-                    obs_min = float(airgap_info.get("observed_min_radial", req_min_radial))
-                    obs_max = float(airgap_info.get("observed_max_radial", req_max_radial))
+            if geometry_is_fixed:
+                fixed_gap = float(pre_airgap_info["observed_mean_radial"])
+                print(f"\n[i] ({gid}): training data is FIXED-GAP ({fixed_gap:.4f} mm radial). "
+                      f"--airgap_min/--airgap_max [{req_min_radial:.3f}, {req_max_radial:.3f}] mm is "
+                      f"ignored for THIS geometry -- the airgap is pinned to its observed fixed value "
+                      f"instead of being treated as a free decision variable.")
+                # airgap_var_idx stays None -> falls through to the
+                # data-driven fallback below, which enforces the fixed gap
+                # via enforce_airgap()'s is_fixed branch.
+            else:
+                airgap_var_idx = rotor_out_idx
+                runtime_bounds["lb"][airgap_var_idx] = float(req_min_radial)
+                runtime_bounds["ub"][airgap_var_idx] = float(req_max_radial)
+
+            if not geometry_is_fixed:
+                if pre_airgap_info is not None:
+                    obs_min = float(pre_airgap_info.get("observed_min_radial", req_min_radial))
+                    obs_max = float(pre_airgap_info.get("observed_max_radial", req_max_radial))
                     print(f"\n[i] ({gid}): optimizing radial airgap directly in [{req_min_radial:.3f}, "
                           f"{req_max_radial:.3f}] mm.")
                     print(f"    Training airgap span seen in data: [{obs_min:.3f}, {obs_max:.3f}] mm radial")
-            else:
-                print(f"\n[i] ({gid}): optimizing radial airgap directly in [{req_min_radial:.3f}, "
-                      f"{req_max_radial:.3f}] mm.")
+                else:
+                    print(f"\n[i] ({gid}): optimizing radial airgap directly in [{req_min_radial:.3f}, "
+                          f"{req_max_radial:.3f}] mm.")
 
     # ---> DATA-DRIVEN AIRGAP FALLBACK <---
     # If no explicit airgap range is provided, use the airgap relationship
